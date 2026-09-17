@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "FRBayes"
+version = "0.1.0"
+description = "Bayesian parameter estimation for Fast Radio Bursts using JAX and NumPyro"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "jax",
+    "jaxlib",
+    "numpyro",
+    "numpy",
+    "scipy",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "jupyter",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
