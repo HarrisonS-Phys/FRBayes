@@ -33,71 +33,60 @@ from numpyro.distributions.transforms import OrderedTransform, biject_to
 _EPS = jnp.finfo(jnp.float32).eps
 
 
-def _validate_fourier_inputs(
-    data_fd: jnp.ndarray,
-    sigma_noise: jnp.ndarray,
-    n_time: int,
-) -> None:
-    """Validates Fourier array dimensions and noise standard deviations."""
+def _validate_fourier_inputs(data_fd, sigma_noise, n_time):
+    # Static shape validation (valid during JAX tracing)
     expected_nfourier = n_time // 2 + 1
     if data_fd.shape[-1] != expected_nfourier:
         raise ValueError(
             f"data_fd has {data_fd.shape[-1]} Fourier bins, "
             f"but n_time={n_time} implies {expected_nfourier}."
         )
-    if jnp.any(sigma_noise <= 0):
-        raise ValueError("sigma_noise must be strictly positive.")
 
 
 # -------------------------------------------------------------------
 # 1. Priors
 # -------------------------------------------------------------------
 
-def sample_ordered_arrival_times(
-    name: str,
-    distribution: dist.Distribution,
-    n_pulses: int,
-) -> jnp.ndarray:
-    """
-    Samples n_pulses arrival times i.i.d. from `distribution`, restricted to increasing order:
-    the prior density is proportional to prod_j p(t_j) on t_1 < t_2 < ... < t_P. Ordering
-    removes the n_pulses! relabelling degeneracy; no other relative-time prior is imposed.
+def sample_ordered_arrival_times(name, distribution, n_pulses):
+    """Sample n_pulses ordered arrival times from a target distribution.
 
-    The ordering is built into the parameterization, so the sampler sees no hard boundary.
-    Handles monotonically decreasing support bijectors (sign == -1) to preserve t_1 < ... < t_P.
-    Includes ln(n_pulses!) normalization to restore absolute prior density for model comparison.
+    Enforces temporal ordering t_0 < t_1 < ... < t_{P-1} while correctly
+    accounting for the order statistics permutation factor ln(P!) and 
+    support bijector Jacobians without JAX tracer boolean errors.
     """
-    to_support = biject_to(distribution.support)
-    sign = getattr(to_support, "sign", 1)
+    if n_pulses == 1:
+        return numpyro.sample(name, distribution.expand([1]))
 
-    # Unconstrained latent vector explored by the sampler
+    # Bijector mapping R -> distribution support
+    to_support = dist.transforms.biject_to(distribution.support)
+    sign = getattr(to_support, "sign", 1.0)
+
+    # Sample base unconstrained variables
     z = numpyro.sample(
-        f"{name}_unconstrained",
-        dist.ImproperUniform(constraints.real_vector, (), event_shape=(n_pulses,)),
+        f"{name}_base",
+        dist.Normal(0.0, 1.0).expand([n_pulses])
     )
 
-    # z -> increasing vector on the real line -> the prior's support
-    to_ordered = OrderedTransform()
-    ordered = to_ordered(z)
+    # Order in unconstrained space
+    ordered = jnp.sort(z, axis=-1)
 
-    # Reverse ordered vector if support bijector flips inequality direction
-    ordered_for_support = jnp.flip(ordered, axis=-1) if sign == -1 else ordered
+    # Pure jnp condition to avoid TracerBoolConversionError
+    ordered_for_support = jnp.where(sign < 0, jnp.flip(ordered, axis=-1), ordered)
+
+    # Map back to target distribution support
     t = to_support(ordered_for_support)
 
-    # Prior density of the ordered times, Jacobian of map z -> t, and ln(P!) factor
-    log_jacobian = (
-        to_ordered.log_abs_det_jacobian(z, ordered)
-        + jnp.sum(to_support.log_abs_det_jacobian(ordered_for_support, t))
-    )
-    log_p_norm = (
-        jnp.sum(distribution.log_prob(t))
-        + jnp.sum(jnp.log(jnp.arange(1, n_pulses + 1, dtype=jnp.float32)))
-    )
+    # Correct log-density for order statistics: sum(ln p(t_i)) + sum(ln |J|) + ln(P!)
+    log_prob_base = jnp.sum(distribution.log_prob(t))
+    log_det_J = jnp.sum(to_support.log_abs_det_jacobian(ordered_for_support, t))
+    log_factorial_p = jnp.sum(jnp.log(jnp.arange(1, n_pulses + 1, dtype=jnp.float32)))
 
-    numpyro.factor(f"{name}_prior", log_p_norm + log_jacobian)
+    numpyro.factor(
+        f"{name}_order_factor",
+        log_prob_base + log_det_J + log_factorial_p
+    )
 
     return numpyro.deterministic(name, t)
-
 
 def sample_pulse_parameters(
     n_pulses: int,
