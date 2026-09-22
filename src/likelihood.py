@@ -30,7 +30,23 @@ from numpyro.distributions import constraints
 from numpyro.distributions.transforms import OrderedTransform, biject_to
 
 
-_TINY = jnp.finfo(jnp.float32).tiny
+_EPS = jnp.finfo(jnp.float32).eps
+
+
+def _validate_fourier_inputs(
+    data_fd: jnp.ndarray,
+    sigma_noise: jnp.ndarray,
+    n_time: int,
+) -> None:
+    """Validates Fourier array dimensions and noise standard deviations."""
+    expected_nfourier = n_time // 2 + 1
+    if data_fd.shape[-1] != expected_nfourier:
+        raise ValueError(
+            f"data_fd has {data_fd.shape[-1]} Fourier bins, "
+            f"but n_time={n_time} implies {expected_nfourier}."
+        )
+    if jnp.any(sigma_noise <= 0):
+        raise ValueError("sigma_noise must be strictly positive.")
 
 
 # -------------------------------------------------------------------
@@ -42,32 +58,46 @@ def sample_ordered_arrival_times(
     distribution: dist.Distribution,
     n_pulses: int,
 ) -> jnp.ndarray:
+    """
+    Samples n_pulses arrival times i.i.d. from `distribution`, restricted to increasing order:
+    the prior density is proportional to prod_j p(t_j) on t_1 < t_2 < ... < t_P. Ordering
+    removes the n_pulses! relabelling degeneracy; no other relative-time prior is imposed.
+
+    The ordering is built into the parameterization, so the sampler sees no hard boundary.
+    Handles monotonically decreasing support bijectors (sign == -1) to preserve t_1 < ... < t_P.
+    Includes ln(n_pulses!) normalization to restore absolute prior density for model comparison.
+    """
     to_support = biject_to(distribution.support)
+    sign = getattr(to_support, "sign", 1)
 
-    # Bijectors in NumPyro define .sign (+1 for increasing, -1 for decreasing)
-    if getattr(to_support, "sign", 1) != 1:
-        raise ValueError(
-            f"Cannot time-order prior '{name}': support bijection {to_support!r} "
-            f"is monotonically decreasing and would invert arrival times to t_1 > t_2."
-        )
-
-    # Unconstrained latent vector
+    # Unconstrained latent vector explored by the sampler
     z = numpyro.sample(
         f"{name}_unconstrained",
         dist.ImproperUniform(constraints.real_vector, (), event_shape=(n_pulses,)),
     )
 
+    # z -> increasing vector on the real line -> the prior's support
     to_ordered = OrderedTransform()
     ordered = to_ordered(z)
-    t = to_support(ordered)
 
+    # Reverse ordered vector if support bijector flips inequality direction
+    ordered_for_support = jnp.flip(ordered, axis=-1) if sign == -1 else ordered
+    t = to_support(ordered_for_support)
+
+    # Prior density of the ordered times, Jacobian of map z -> t, and ln(P!) factor
     log_jacobian = (
         to_ordered.log_abs_det_jacobian(z, ordered)
-        + jnp.sum(to_support.log_abs_det_jacobian(ordered, t))
+        + jnp.sum(to_support.log_abs_det_jacobian(ordered_for_support, t))
     )
-    numpyro.factor(f"{name}_prior", jnp.sum(distribution.log_prob(t)) + log_jacobian)
+    log_p_norm = (
+        jnp.sum(distribution.log_prob(t))
+        + jnp.sum(jnp.log(jnp.arange(1, n_pulses + 1, dtype=jnp.float32)))
+    )
+
+    numpyro.factor(f"{name}_prior", log_p_norm + log_jacobian)
 
     return numpyro.deterministic(name, t)
+
 
 def sample_pulse_parameters(
     n_pulses: int,
@@ -106,7 +136,7 @@ def overlap_log_prior(
 
         ln p = -K / ln[1 + exp((1 - R0) / w)] * sum_{j<k} ln[1 + exp((R_jk - R0) / w)]
 
-    Constant for R_jk < R0 and rising with slope approaching K / (1 - R0) above it;
+    Approximately flat for R_jk < R0 and rising with slope approaching K / (1 - R0) above it;
     w sets the sharpness of the transition, and K is the penalty at total overlap R_jk = 1.
     """
     # Each pair once, since R is symmetric
@@ -160,15 +190,14 @@ def _snr_and_overlaps(
     """
     SNR_opt,j = sqrt(G_jj),   SNR_mf,j = rho_j / SNR_opt,j,   R_jk = G_jk / (SNR_opt,j SNR_opt,k).
     """
-    eye = jnp.eye(rho.shape[0], dtype=gram.dtype)
-
-    # Floor guards against division by zero for a degenerate (all-zero) template
-    snr_opt = jnp.sqrt(jnp.maximum(jnp.diag(gram), _TINY))
+    # Floor guard using float32 machine epsilon against division by zero for degenerate templates
+    snr_opt = jnp.sqrt(jnp.maximum(jnp.diag(gram), _EPS))
     snr_mf = rho / snr_opt
 
+    # Compute correlation matrix R_jk and symmetrize without hard-replacing the diagonal
     R = gram / (snr_opt[:, None] * snr_opt[None, :])
-    # Diagonal is exactly 1 by definition
-    R = R * (1.0 - eye) + eye
+    R = 0.5 * (R + R.T)
+
     return snr_opt, snr_mf, R
 
 
@@ -181,14 +210,17 @@ def _gaussian_fluence_prior_cholesky(
     s_opt: jnp.ndarray,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Cholesky factor of [R + diag(s_opt^-2)], the matrix defining both the marginalized
-    likelihood and the conditional fluence distribution under the zero-mean Gaussian fluence
-    prior with s_(j) = s_opt,(j) / SNR_opt,(j). Shared by both so they cannot fall out of sync.
+    Cholesky factor of [R + diag(s_opt^-2) + jitter*I], the matrix defining both the
+    marginalized likelihood and the conditional fluence distribution under the zero-mean
+    Gaussian fluence prior with s_(j) = s_opt,(j) / SNR_opt,(j). Includes 1e-6 diagonal jitter
+    to maintain positive-definiteness when R_jk -> 1 in float32.
 
     Returns (cholesky factor, s_opt broadcast to shape (n_pulses,)).
     """
-    s_opt = jnp.broadcast_to(jnp.asarray(s_opt, dtype=R.dtype), R.shape[:1])
-    return jnp.linalg.cholesky(R + jnp.diag(s_opt ** -2)), s_opt
+    s_opt_broadcast = jnp.broadcast_to(jnp.asarray(s_opt, dtype=jnp.float32), R.shape[:1])
+    jitter = 1e-6 * jnp.eye(R.shape[0], dtype=jnp.float32)
+    A_matrix = R + jnp.diag(s_opt_broadcast ** -2) + jitter
+    return jnp.linalg.cholesky(A_matrix), s_opt_broadcast
 
 
 def marginalized_log_likelihood(
@@ -205,14 +237,14 @@ def marginalized_log_likelihood(
     Returns (log_likelihood, R, snr_opt, snr_mf).
     """
     snr_opt, snr_mf, R = _snr_and_overlaps(rho, gram)
-    chol, s_opt = _gaussian_fluence_prior_cholesky(R, s_opt)
+    chol, s_opt_broadcast = _gaussian_fluence_prior_cholesky(R, s_opt)
 
     # Quadratic term via a triangular solve rather than an explicit inverse
     v = jax.scipy.linalg.solve_triangular(chol, snr_mf, lower=True)
     quadratic = 0.5 * jnp.sum(v ** 2)
 
     # ln det[1 + diag(s_opt^2) R] = sum_j ln s_opt,j^2 + ln det[R + diag(s_opt^-2)]
-    log_det = 2.0 * jnp.sum(jnp.log(s_opt)) + 2.0 * jnp.sum(jnp.log(jnp.diag(chol)))
+    log_det = 2.0 * jnp.sum(jnp.log(s_opt_broadcast)) + 2.0 * jnp.sum(jnp.log(jnp.diag(chol)))
 
     return quadratic - 0.5 * log_det, R, snr_opt, snr_mf
 
@@ -294,6 +326,8 @@ def fourier_marginalized_likelihood(
     if "A" in priors:
         raise ValueError("'A' is marginalized analytically and must not be in priors.")
 
+    _validate_fourier_inputs(data_fd, sigma_noise, n_time)
+
     # Sample shape parameters and evaluate the unit-fluence templates
     params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
     templates = pulse_templates(params_stacked, single_pulse_fn)
@@ -338,6 +372,8 @@ def fourier_gaussian_likelihood(
     if "A" not in priors:
         raise ValueError("'A' must be in priors; otherwise fluences default to 1.")
 
+    _validate_fourier_inputs(data_fd, sigma_noise, n_time)
+
     # Sample all parameters and sum the pulses (fluences included)
     params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
     model_fd = jnp.sum(pulse_templates(params_stacked, single_pulse_fn), axis=0)
@@ -362,6 +398,7 @@ def time_domain_gaussian_likelihood(
 ):
     """
     Time-domain Gaussian likelihood on the inverse transform of the Fourier-domain model.
+    Validates the Fourier convention and Gaussian likelihood when DC/Nyquist handling is matched.
 
     data_td:        real (nfreq, ntime); must be baseline-subtracted, since this likelihood
                     uses every Fourier bin of the model, including DC
