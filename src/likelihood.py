@@ -288,7 +288,7 @@ def draw_fluences_gaussian_marginalized(
 # 4. NumPyro models
 # -------------------------------------------------------------------
 
-def fourier_marginalized_likelihood(
+def FD_marg_fullnormal_Gaussianlikelihood(
     data_fd: jnp.ndarray,
     sigma_noise: jnp.ndarray,
     n_time: int,
@@ -302,7 +302,7 @@ def fourier_marginalized_likelihood(
     time_param: str = "mean_arrival_time",
 ):
     """
-    Fourier-domain likelihood with the pulse fluences marginalized analytically.
+    Fourier-domain Gaussian likelihood with the pulse fluences marginalized analytically using a zero-mean Gaussian prior.
 
     data_fd:     complex (nfreq, nfourier), in the convention of the module docstring
     sigma_noise: std of the real/imaginary part of each bin, shape (nfreq, 1) or (nfreq, nfourier)
@@ -343,7 +343,7 @@ def fourier_marginalized_likelihood(
     numpyro.factor("marginalized_log_likelihood", log_like)
 
 
-def fourier_gaussian_likelihood(
+def FD_gaussian_likelihood(
     data_fd: jnp.ndarray,
     sigma_noise: jnp.ndarray,
     n_time: int,
@@ -376,7 +376,7 @@ def fourier_gaussian_likelihood(
     numpyro.factor("log_likelihood", -0.5 * jnp.sum(jnp.abs(residual) ** 2 / sigma ** 2))
 
 
-def time_domain_gaussian_likelihood(
+def TD_gaussian_likelihood(
     data_td: jnp.ndarray,
     sigma_noise_td: jnp.ndarray,
     n_pulses: int,
