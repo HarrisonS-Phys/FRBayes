@@ -376,7 +376,7 @@ def draw_fluences_halfnormal_nooverlap_gaussmarg(
     key: jax.Array,
 ) -> jnp.ndarray:
     """
-    Draws fluences for the marginalization performed in `FD_marg_halfnormal_nooverlap_Gaussianlikelihood`.
+    Draws fluences for the marginalization performed in `FD_marg_halfnormal_nooverlap_gaussianlikelihood`.
 
     Under the half-normal prior with s_(j) = s_opt,(j) / SNR_opt,(j), and with the pulses
     assumed non-overlapping, the components are conditionally independent and each fluence
@@ -437,7 +437,7 @@ def draw_fluences_halfnormal_nooverlap_gaussmarg(
 # evaluates those templates, and applies one of the likelihoods of Sections 2 and 3.
 # -------------------------------------------------------------------
 
-def FD_marg_fullnormal_Gaussianlikelihood(
+def FD_marg_fullnormal_gaussianlikelihood(
     data_fd: jnp.ndarray,
     sigma_noise: jnp.ndarray,
     n_time: int,
@@ -491,7 +491,7 @@ def FD_marg_fullnormal_Gaussianlikelihood(
 
     numpyro.factor("marginalized_log_likelihood", log_like)
 
-def FD_marg_halfnormal_nooverlap_Gaussianlikelihood(
+def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
     data_fd: jnp.ndarray,
     sigma_noise: jnp.ndarray,
     n_time: int,
