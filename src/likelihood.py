@@ -193,7 +193,15 @@ def _snr_and_overlaps(
 
 
 # -------------------------------------------------------------------
-# 3. Fluence marginalization (zero-mean Gaussian fluence prior)
+# 3. Fluence marginalization
+#
+# These are pure functions of arrays: given the matched filter and the Gram matrix they return
+# a marginalized log-likelihood, or draw fluences, with no NumPyro sample sites involved.
+# They are kept separate from the NumPyro models of Section 4 for two reasons. First, the
+# algebra can then be unit-tested directly against numerical integration over the fluences,
+# without running a sampler. Second, each marginalized likelihood shares its linear algebra
+# with its paired fluence sampler, so the conditional distribution used to recover fluences
+# cannot drift out of step with the prior that was marginalized over.
 # -------------------------------------------------------------------
 
 def _gaussian_fluence_prior_cholesky(
@@ -214,7 +222,7 @@ def _gaussian_fluence_prior_cholesky(
     return jnp.linalg.cholesky(A_matrix), s_opt_broadcast
 
 
-def marginalized_log_likelihood(
+def fullnormal_gaussmarg_log_likelihood(
     rho: jnp.ndarray,
     gram: jnp.ndarray,
     s_opt: jnp.ndarray,
@@ -238,6 +246,41 @@ def marginalized_log_likelihood(
     log_det = 2.0 * jnp.sum(jnp.log(s_opt_broadcast)) + 2.0 * jnp.sum(jnp.log(jnp.diag(chol)))
 
     return quadratic - 0.5 * log_det, R, snr_opt, snr_mf
+
+def halfnormal_nooverlap_gaussmarg_log_likelihood(
+    rho: jnp.ndarray,
+    gram: jnp.ndarray,
+    s_opt: jnp.ndarray,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Fluence-marginalized log-likelihood under a half-normal fluence prior, assuming the pulse
+    components do not overlap (G_jk = SNR_opt,j^2 delta_jk), up to a parameter-independent
+    constant:
+
+        ln p = sum_j { z_j^2 / 2 + ln[1 + erf(z_j / sqrt(2))] - 1/2 ln(1 + s_opt,j^2) },
+        z_j  = s_opt,j SNR_mf,j / sqrt(1 + s_opt,j^2).
+
+    Only the diagonal of `gram` enters: that is where the non-overlap approximation is applied.
+    The full matrix is still taken as an argument so the caller can use the off-diagonals for
+    the overlap prior and for diagnostics.
+
+    Unlike the full-normal case this is NOT symmetric under SNR_mf -> -SNR_mf: the erf term
+    suppresses negative-fluence solutions, so anti-correlated template placements are not
+    spurious likelihood maxima.
+
+    Returns (log_likelihood, R, snr_opt, snr_mf).
+    """
+    snr_opt, snr_mf, R = _snr_and_overlaps(rho, gram)
+    s_opt_broadcast = jnp.broadcast_to(jnp.asarray(s_opt, dtype=jnp.float32), rho.shape)
+
+    z = s_opt_broadcast * snr_mf / jnp.sqrt(1.0 + s_opt_broadcast ** 2)
+
+    # ln[1 + erf(z/sqrt2)] = ln2 + ln Phi(z), evaluated without overflowing exp(z^2/2)
+    log_like = jnp.sum(
+        0.5 * z ** 2 + jnp.log(2.0) + norm.logcdf(z) - 0.5 * jnp.log1p(s_opt_broadcast ** 2)
+    )
+
+    return log_like, R, snr_opt, snr_mf
 
 
 def draw_fluences_fullnormal_gaussmarg(
@@ -285,14 +328,14 @@ def draw_fluences_fullnormal_gaussmarg(
     accept = jnp.all(fluences > 0, axis=-1)
     return fluences, accept
 
-def draw_fluences_halfnormal_gaussmarg(
+def draw_fluences_halfnormal_nooverlap_gaussmarg(
     snr_opt: jnp.ndarray,
     snr_mf: jnp.ndarray,
     s_opt: float,
     key: jax.Array,
 ) -> jnp.ndarray:
     """
-    Draws fluences for the marginalization performed in `FD_marg_halfnormal_Gaussianlikelihood`.
+    Draws fluences for the marginalization performed in `FD_marg_halfnormal_nooverlap_Gaussianlikelihood`.
 
     Under the half-normal prior with s_(j) = s_opt,(j) / SNR_opt,(j), and with the pulses
     assumed non-overlapping, the components are conditionally independent and each fluence
@@ -329,6 +372,12 @@ def draw_fluences_halfnormal_gaussmarg(
 
 # -------------------------------------------------------------------
 # 4. NumPyro models
+#
+# "Model" here is NumPyro's sense of the word: a function that declares the prior sample sites
+# and contributes a log-likelihood factor, thereby specifying the full posterior. It is NOT a
+# model of the burst. The physical pulse models -- the templates T and F of model.py -- enter
+# only through `single_pulse_fn`, and each function below samples the pulse parameters,
+# evaluates those templates, and applies one of the likelihoods of Sections 2 and 3.
 # -------------------------------------------------------------------
 
 def FD_marg_fullnormal_Gaussianlikelihood(
@@ -370,7 +419,7 @@ def FD_marg_fullnormal_Gaussianlikelihood(
     rho, gram = matched_filter_and_gram(templates[..., keep], data_fd[:, keep], 1.0 / sigma ** 2)
 
     # Analytic marginalization over the fluences
-    log_like, R, snr_opt, snr_mf = marginalized_log_likelihood(rho, gram, s_opt)
+    log_like, R, snr_opt, snr_mf = fullnormal_gaussmarg_log_likelihood(rho, gram, s_opt)
 
     # Stored per sample so fluences can be drawn afterwards without re-evaluating templates
     numpyro.deterministic("gram", gram)
@@ -385,7 +434,7 @@ def FD_marg_fullnormal_Gaussianlikelihood(
 
     numpyro.factor("marginalized_log_likelihood", log_like)
 
-def FD_marg_halfnormal_Gaussianlikelihood(
+def FD_marg_halfnormal_nooverlap_Gaussianlikelihood(
     data_fd: jnp.ndarray,
     sigma_noise: jnp.ndarray,
     n_time: int,
@@ -399,23 +448,26 @@ def FD_marg_halfnormal_Gaussianlikelihood(
     time_param: str = "mean_arrival_time",
 ):
     """
-    Fourier-domain likelihood with the fluences marginalized under a half-normal prior,
-    assuming the pulse components do not overlap (G_jk = SNR_opt,j^2 delta_jk):
+    Fourier-domain Gaussian likelihood with the pulse fluences marginalized analytically using a
+    half-normal prior, assuming the pulse components do not overlap.
 
-        ln p = sum_j { z_j^2 / 2 + ln[1 + erf(z_j / sqrt(2))] - 1/2 ln(1 + s_opt,j^2) },
-        z_j  = s_opt,j SNR_mf,j / sqrt(1 + s_opt,j^2).
+    data_fd:     complex (nfreq, nfourier), in the convention of the module docstring
+    sigma_noise: std of the real/imaginary part of each bin, shape (nfreq, 1) or (nfreq, nfourier)
+    n_time:      number of time samples N (identifies the Nyquist bin)
+    s_opt:       characteristic SNR scale of the fluence prior (scalar or per-pulse)
 
-    Unlike the full-normal marginalization this is NOT symmetric under SNR_mf -> -SNR_mf:
-    the erf term suppresses negative-fluence solutions, so anti-correlated placements are
-    not spurious maxima. The non-overlap approximation is exact only for disjoint components,
-    so the overlap prior below is what keeps it valid; check the recorded 'overlap' afterwards.
+    The non-overlap approximation is exact only for components with disjoint support, so the
+    overlap prior is what keeps it valid; check the recorded 'overlap' afterwards.
 
-    Fluences must NOT be in priors: templates are evaluated at unit fluence. The conditional
-    fluence distribution here is a normal TRUNCATED to A > 0 (independent across components),
-    not the multivariate normal of the full-normal marginalization.
+    Fluences must NOT be in priors: templates are evaluated at unit fluence.
+    Recover fluences with `draw_fluences_halfnormal_nooverlap_gaussmarg` from the 'snr_opt' and 'snr_mf'
+    sites; the conditional there is a truncated normal, not the multivariate normal of the
+    full-normal marginalization.
     """
     if "A" in priors:
         raise ValueError("'A' is marginalized analytically and must not be in priors.")
+
+    _validate_fourier_inputs(data_fd, sigma_noise, n_time)
 
     # Sample shape parameters and evaluate the unit-fluence templates
     params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
@@ -426,24 +478,17 @@ def FD_marg_halfnormal_Gaussianlikelihood(
     sigma = jnp.broadcast_to(jnp.asarray(sigma_noise, dtype=jnp.float32), data_fd.shape)[:, keep]
     rho, gram = matched_filter_and_gram(templates[..., keep], data_fd[:, keep], 1.0 / sigma ** 2)
 
-    # Only the diagonal of the Gram matrix enters the likelihood: this is where the
-    # non-overlap approximation is applied. The off-diagonals are kept for the prior below.
-    snr_opt, snr_mf, R = _snr_and_overlaps(rho, gram)
+    # Analytic marginalization over the fluences
+    log_like, R, snr_opt, snr_mf = halfnormal_nooverlap_gaussmarg_log_likelihood(rho, gram, s_opt)
 
-    s = jnp.broadcast_to(jnp.asarray(s_opt, dtype=gram.dtype), (n_pulses,))
-    z = s * snr_mf / jnp.sqrt(1.0 + s ** 2)
-
-    # ln[1 + erf(z/sqrt2)] = ln2 + ln Phi(z), evaluated without overflowing exp(z^2/2)
-    log_like = jnp.sum(
-        0.5 * z ** 2 + jnp.log(2.0) + norm.logcdf(z) - 0.5 * jnp.log1p(s ** 2)
-    )
-
-    # Stored per sample for fluence recovery and diagnostics
+    # Stored per sample so fluences can be drawn afterwards without re-evaluating templates.
+    # z_j is deliberately not stored: it is a fixed function of 'snr_mf' and the chosen s_opt,
+    # z_j = s_opt,j SNR_mf,j / sqrt(1 + s_opt,j^2), so storing it would duplicate information and
+    # leave the two marginalized likelihoods with different sets of recorded sites.
     numpyro.deterministic("gram", gram)
     numpyro.deterministic("rho_mf", rho)
     numpyro.deterministic("snr_opt", snr_opt)
     numpyro.deterministic("snr_mf", snr_mf)
-    numpyro.deterministic("z", z)
 
     if n_pulses > 1:
         # Overlaps recorded for diagnostics, and penalized to keep the non-overlap approximation valid
@@ -451,7 +496,6 @@ def FD_marg_halfnormal_Gaussianlikelihood(
         numpyro.factor("overlap_prior", overlap_log_prior(R, overlap_K, overlap_R0, overlap_w))
 
     numpyro.factor("marginalized_log_likelihood", log_like)
-
 
 def FD_gaussian_likelihood(
     data_fd: jnp.ndarray,
