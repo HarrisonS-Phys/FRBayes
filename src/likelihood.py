@@ -442,6 +442,7 @@ def FD_marg_halfnormal_nooverlap_Gaussianlikelihood(
     priors: Dict[str, dist.Distribution],
     single_pulse_fn: Callable,
     s_opt: float,
+    apply_overlap_prior: bool = False,
     overlap_K: float = 100.0,
     overlap_R0: float = 0.9,
     overlap_w: float = 0.002,
@@ -456,13 +457,27 @@ def FD_marg_halfnormal_nooverlap_Gaussianlikelihood(
     n_time:      number of time samples N (identifies the Nyquist bin)
     s_opt:       characteristic SNR scale of the fluence prior (scalar or per-pulse)
 
-    The non-overlap approximation is exact only for components with disjoint support, so the
-    overlap prior is what keeps it valid; check the recorded 'overlap' afterwards.
-
     Fluences must NOT be in priors: templates are evaluated at unit fluence.
-    Recover fluences with `draw_fluences_halfnormal_nooverlap_gaussmarg` from the 'snr_opt' and 'snr_mf'
-    sites; the conditional there is a truncated normal, not the multivariate normal of the
-    full-normal marginalization.
+    Recover fluences with `draw_fluences_halfnormal_nooverlap_gaussmarg` from the 'snr_opt' and
+    'snr_mf' sites; the conditional there is a truncated normal, not the multivariate normal of
+    the full-normal marginalization.
+
+    OVERLAP PRIOR (n_pulses > 1 only, and OFF by default):
+    The likelihood discards the off-diagonal elements of the Gram matrix, so it cannot itself
+    notice two components landing on the same pulse -- it would read that as two independent
+    detections and double-count the evidence. The overlap prior of `overlap_log_prior` is
+    therefore not a refinement of the likelihood but the thing that enforces its validity
+    condition. Whether it is applied is controlled by `apply_overlap_prior`, kept separate from
+    `overlap_K` so that switching the prior off is distinct from choosing a zero-nat penalty,
+    which is itself a valid setting. It defaults to False because at the usual settings the
+    prior is flat until R_jk approaches 1, so it only catches total collapse while the
+    non-overlap approximation is already inaccurate by R_jk ~ 0.3; if it is switched on,
+    overlap_R0 should be chosen low enough to actually bound the approximation error rather
+    than left at 0.9.
+
+    The normalized overlaps R_jk are recorded as 'overlap' whether or not the prior is applied,
+    since the Gram matrix is computed regardless and they are the post-hoc check on whether the
+    non-overlap assumption held. Inspect them before trusting a multi-pulse fit.
     """
     if "A" in priors:
         raise ValueError("'A' is marginalized analytically and must not be in priors.")
@@ -478,7 +493,7 @@ def FD_marg_halfnormal_nooverlap_Gaussianlikelihood(
     sigma = jnp.broadcast_to(jnp.asarray(sigma_noise, dtype=jnp.float32), data_fd.shape)[:, keep]
     rho, gram = matched_filter_and_gram(templates[..., keep], data_fd[:, keep], 1.0 / sigma ** 2)
 
-    # Analytic marginalization over the fluences
+    # Analytic marginalization over the fluences; only the diagonal of the Gram matrix enters
     log_like, R, snr_opt, snr_mf = halfnormal_nooverlap_gaussmarg_log_likelihood(rho, gram, s_opt)
 
     # Stored per sample so fluences can be drawn afterwards without re-evaluating templates.
@@ -491,9 +506,13 @@ def FD_marg_halfnormal_nooverlap_Gaussianlikelihood(
     numpyro.deterministic("snr_mf", snr_mf)
 
     if n_pulses > 1:
-        # Overlaps recorded for diagnostics, and penalized to keep the non-overlap approximation valid
+        # Recorded regardless, as the check on the non-overlap assumption
         numpyro.deterministic("overlap", R[jnp.triu_indices(n_pulses, k=1)])
-        numpyro.factor("overlap_prior", overlap_log_prior(R, overlap_K, overlap_R0, overlap_w))
+
+        # A Python bool, so this resolves at trace time: with the prior off, nothing is added
+        # to the compiled graph
+        if apply_overlap_prior:
+            numpyro.factor("overlap_prior", overlap_log_prior(R, overlap_K, overlap_R0, overlap_w))
 
     numpyro.factor("marginalized_log_likelihood", log_like)
 
