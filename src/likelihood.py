@@ -24,6 +24,8 @@ PRECISION: float32 throughout; see the note in model.py on relative times and re
 from typing import Callable, Dict, Tuple
 import jax
 import jax.numpy as jnp
+from jax.scipy.special import ndtri
+from jax.scipy.stats import norm
 import numpyro
 import numpyro.distributions as dist
 from numpyro.distributions import constraints
@@ -238,7 +240,7 @@ def marginalized_log_likelihood(
     return quadratic - 0.5 * log_det, R, snr_opt, snr_mf
 
 
-def draw_fluences_gaussian_marginalized(
+def draw_fluences_fullnormal_gaussmarg(
     gram: jnp.ndarray,
     rho: jnp.ndarray,
     s_opt: float,
@@ -283,6 +285,47 @@ def draw_fluences_gaussian_marginalized(
     accept = jnp.all(fluences > 0, axis=-1)
     return fluences, accept
 
+def draw_fluences_halfnormal_gaussmarg(
+    snr_opt: jnp.ndarray,
+    snr_mf: jnp.ndarray,
+    s_opt: float,
+    key: jax.Array,
+) -> jnp.ndarray:
+    """
+    Draws fluences for the marginalization performed in `FD_marg_halfnormal_Gaussianlikelihood`.
+
+    Under the half-normal prior with s_(j) = s_opt,(j) / SNR_opt,(j), and with the pulses
+    assumed non-overlapping, the components are conditionally independent and each fluence
+    follows a normal distribution truncated to A > 0:
+
+        A_(j) ~ N( mu_(j), sigma_A,(j)^2 ) restricted to A_(j) > 0,
+        mu_(j)      = [s_opt,(j)^2 / (1 + s_opt,(j)^2)] SNR_mf,(j) / SNR_opt,(j),
+        sigma_A,(j) = [s_opt,(j) / sqrt(1 + s_opt,(j)^2)] / SNR_opt,(j),
+
+    so that mu_(j) / sigma_A,(j) = z_(j). Positivity is built into the prior, so unlike the
+    full-normal marginalization every draw is valid and no rejection step is required.
+
+    snr_opt: (n_samples, n_pulses), the 'snr_opt' deterministic site
+    snr_mf:  (n_samples, n_pulses), the 'snr_mf' deterministic site
+
+    Returns fluences of shape (n_samples, n_pulses).
+    """
+    s = jnp.asarray(s_opt, dtype=snr_mf.dtype)
+    z = s * snr_mf / jnp.sqrt(1.0 + s ** 2)
+
+    # Conditional standard deviation of the fluence
+    sigma_A = (s / jnp.sqrt(1.0 + s ** 2)) / snr_opt
+
+    # Standardized truncated-normal draw: y ~ N(z, 1) restricted to y > 0, by inverse CDF.
+    # Written as z - ndtri(v Phi(z)) rather than ndtri(Phi(-z) + u[1 - Phi(-z)]) so that
+    # no precision is lost when Phi(-z) approaches 1 (strongly negative z).
+    v = jax.random.uniform(key, snr_mf.shape, dtype=snr_mf.dtype,
+                           minval=jnp.finfo(snr_mf.dtype).tiny, maxval=1.0)
+    y = z - jax.scipy.special.ndtri(v * jax.scipy.stats.norm.cdf(z))
+
+    # Convert from SNR units to fluence
+    return sigma_A * y
+
 
 # -------------------------------------------------------------------
 # 4. NumPyro models
@@ -310,7 +353,7 @@ def FD_marg_fullnormal_Gaussianlikelihood(
     s_opt:       characteristic SNR scale of the fluence prior (scalar or per-pulse)
 
     Fluences must NOT be in priors: templates are evaluated at unit fluence.
-    Recover fluences with `draw_fluences_gaussian_marginalized` from the 'gram' and 'rho_mf' sites.
+    Recover fluences with `draw_fluences_fullnormal_gaussmarg` from the 'gram' and 'rho_mf' sites.
     """
     if "A" in priors:
         raise ValueError("'A' is marginalized analytically and must not be in priors.")
@@ -337,6 +380,73 @@ def FD_marg_fullnormal_Gaussianlikelihood(
 
     if n_pulses > 1:
         # Overlaps recorded for diagnostics, and penalized near total overlap
+        numpyro.deterministic("overlap", R[jnp.triu_indices(n_pulses, k=1)])
+        numpyro.factor("overlap_prior", overlap_log_prior(R, overlap_K, overlap_R0, overlap_w))
+
+    numpyro.factor("marginalized_log_likelihood", log_like)
+
+def FD_marg_halfnormal_Gaussianlikelihood(
+    data_fd: jnp.ndarray,
+    sigma_noise: jnp.ndarray,
+    n_time: int,
+    n_pulses: int,
+    priors: Dict[str, dist.Distribution],
+    single_pulse_fn: Callable,
+    s_opt: float,
+    overlap_K: float = 100.0,
+    overlap_R0: float = 0.9,
+    overlap_w: float = 0.002,
+    time_param: str = "mean_arrival_time",
+):
+    """
+    Fourier-domain likelihood with the fluences marginalized under a half-normal prior,
+    assuming the pulse components do not overlap (G_jk = SNR_opt,j^2 delta_jk):
+
+        ln p = sum_j { z_j^2 / 2 + ln[1 + erf(z_j / sqrt(2))] - 1/2 ln(1 + s_opt,j^2) },
+        z_j  = s_opt,j SNR_mf,j / sqrt(1 + s_opt,j^2).
+
+    Unlike the full-normal marginalization this is NOT symmetric under SNR_mf -> -SNR_mf:
+    the erf term suppresses negative-fluence solutions, so anti-correlated placements are
+    not spurious maxima. The non-overlap approximation is exact only for disjoint components,
+    so the overlap prior below is what keeps it valid; check the recorded 'overlap' afterwards.
+
+    Fluences must NOT be in priors: templates are evaluated at unit fluence. The conditional
+    fluence distribution here is a normal TRUNCATED to A > 0 (independent across components),
+    not the multivariate normal of the full-normal marginalization.
+    """
+    if "A" in priors:
+        raise ValueError("'A' is marginalized analytically and must not be in priors.")
+
+    # Sample shape parameters and evaluate the unit-fluence templates
+    params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
+    templates = pulse_templates(params_stacked, single_pulse_fn)
+
+    # Restrict to the retained bins (DC and Nyquist discarded; see module docstring)
+    keep = _retained_fourier_bins(n_time)
+    sigma = jnp.broadcast_to(jnp.asarray(sigma_noise, dtype=jnp.float32), data_fd.shape)[:, keep]
+    rho, gram = matched_filter_and_gram(templates[..., keep], data_fd[:, keep], 1.0 / sigma ** 2)
+
+    # Only the diagonal of the Gram matrix enters the likelihood: this is where the
+    # non-overlap approximation is applied. The off-diagonals are kept for the prior below.
+    snr_opt, snr_mf, R = _snr_and_overlaps(rho, gram)
+
+    s = jnp.broadcast_to(jnp.asarray(s_opt, dtype=gram.dtype), (n_pulses,))
+    z = s * snr_mf / jnp.sqrt(1.0 + s ** 2)
+
+    # ln[1 + erf(z/sqrt2)] = ln2 + ln Phi(z), evaluated without overflowing exp(z^2/2)
+    log_like = jnp.sum(
+        0.5 * z ** 2 + jnp.log(2.0) + norm.logcdf(z) - 0.5 * jnp.log1p(s ** 2)
+    )
+
+    # Stored per sample for fluence recovery and diagnostics
+    numpyro.deterministic("gram", gram)
+    numpyro.deterministic("rho_mf", rho)
+    numpyro.deterministic("snr_opt", snr_opt)
+    numpyro.deterministic("snr_mf", snr_mf)
+    numpyro.deterministic("z", z)
+
+    if n_pulses > 1:
+        # Overlaps recorded for diagnostics, and penalized to keep the non-overlap approximation valid
         numpyro.deterministic("overlap", R[jnp.triu_indices(n_pulses, k=1)])
         numpyro.factor("overlap_prior", overlap_log_prior(R, overlap_K, overlap_R0, overlap_w))
 
