@@ -30,9 +30,14 @@ import numpyro
 import numpyro.distributions as dist
 from numpyro.distributions import constraints
 from numpyro.distributions.transforms import OrderedTransform, biject_to
+import warnings
 
 
-_EPS = jnp.finfo(jnp.float32).eps
+_EPS = jnp.finfo(jnp.float32).eps  # floor for SNR_opt in _snr_and_overlaps, guarding division by a degenerate (zero-power) template
+
+# z below this is where norm.cdf(z) loses precision and then underflows to 0 in float32,
+# which sends ndtri to -inf in the truncated-normal draw. See draw_fluences_halfnormal_nooverlap_gaussmarg.
+_Z_UNDERFLOW_WARN = -10.0
 
 
 def _validate_fourier_inputs(data_fd, sigma_noise, n_time):
@@ -44,6 +49,22 @@ def _validate_fourier_inputs(data_fd, sigma_noise, n_time):
             f"but n_time={n_time} implies {expected_nfourier}."
         )
 
+    # sigma_noise is broadcast against data_fd, so a channel-count mismatch would otherwise
+    # surface as an obscure broadcasting error deeper in the stack
+    sigma_noise = jnp.asarray(sigma_noise)
+    if sigma_noise.ndim != 2:
+        raise ValueError(
+            f"sigma_noise must be 2D, shape (nfreq, 1) or (nfreq, nfourier); got {sigma_noise.shape}."
+        )
+    if sigma_noise.shape[0] != data_fd.shape[0]:
+        raise ValueError(
+            f"sigma_noise has {sigma_noise.shape[0]} channels but data_fd has {data_fd.shape[0]}."
+        )
+    if sigma_noise.shape[1] not in (1, expected_nfourier):
+        raise ValueError(
+            f"sigma_noise has {sigma_noise.shape[1]} Fourier bins; expected 1 (broadcast) "
+            f"or {expected_nfourier}."
+        )
 
 # -------------------------------------------------------------------
 # 1. Priors
@@ -52,16 +73,34 @@ def _validate_fourier_inputs(data_fd, sigma_noise, n_time):
 def sample_ordered_arrival_times(name, distribution, n_pulses):
     """Sample n_pulses ordered arrival times from a target distribution.
 
-    Enforces temporal ordering t_0 < t_1 < ... < t_{P-1} while correctly
-    accounting for the order statistics permutation factor ln(P!) and 
-    support bijector Jacobians without JAX tracer boolean errors.
+    Enforces temporal ordering t_0 < t_1 < ... < t_{P-1}, with the prior density of the ordered
+    times equal to prod_j p(t_j) on the ordered region (i.e. the order statistics of n_pulses
+    i.i.d. draws), and no other relative-time prior imposed.
+
+    The sampler explores an unconstrained vector z with a standard normal sample site. That
+    site contributes its own log-density to the joint, which is NOT part of the intended prior,
+    so it is subtracted in the factor below; leaving it in place multiplies the prior on t by
+    prod_j N(z_j; 0, 1), which pulls the arrival times toward the middle of the support. The
+    ln(P!) term is a constant and is kept only so the factor matches the order-statistics
+    density as written.
     """
     if n_pulses == 1:
         return numpyro.sample(name, distribution.expand([1]))
 
-    # Bijector mapping R -> distribution support
+    # Ordering by sorting is only equivalent to an ordered prior if the map to the support is
+    # monotonic, which `sign` reports; multivariate supports have no such notion
+    if distribution.event_shape != ():
+        raise ValueError(
+            f"the arrival-time prior must be univariate; got event_shape {distribution.event_shape}."
+        )
     to_support = dist.transforms.biject_to(distribution.support)
-    sign = getattr(to_support, "sign", 1.0)
+    try:
+        sign = to_support.sign
+    except (AttributeError, NotImplementedError):
+        raise ValueError(
+            f"support transform {type(to_support).__name__} of the arrival-time prior does not "
+            f"define `sign`, so it cannot be verified as monotonic and the ordering may not hold."
+        )
 
     # Sample base unconstrained variables
     z = numpyro.sample(
@@ -78,14 +117,16 @@ def sample_ordered_arrival_times(name, distribution, n_pulses):
     # Map back to target distribution support
     t = to_support(ordered_for_support)
 
-    # Correct log-density for order statistics: sum(ln p(t_i)) + sum(ln |J|) + ln(P!)
+    # Correct log-density for order statistics: sum(ln p(t_i)) + sum(ln |J|) + ln(P!),
+    # minus the log-density of the base sample site so it is not double counted
     log_prob_base = jnp.sum(distribution.log_prob(t))
     log_det_J = jnp.sum(to_support.log_abs_det_jacobian(ordered_for_support, t))
     log_factorial_p = jnp.sum(jnp.log(jnp.arange(1, n_pulses + 1, dtype=jnp.float32)))
+    log_prob_z_base = jnp.sum(dist.Normal(0.0, 1.0).log_prob(z))
 
     numpyro.factor(
         f"{name}_order_factor",
-        log_prob_base + log_det_J + log_factorial_p
+        log_prob_base + log_det_J + log_factorial_p - log_prob_z_base
     )
 
     return numpyro.deterministic(name, t)
@@ -355,6 +396,22 @@ def draw_fluences_halfnormal_nooverlap_gaussmarg(
     """
     s = jnp.asarray(s_opt, dtype=snr_mf.dtype)
     z = s * snr_mf / jnp.sqrt(1.0 + s ** 2)
+    # norm.cdf(z) loses precision and then underflows to 0 in float32 for z below about -13,
+    # which sends ndtri to -inf and the draw to +inf. A component there has a fitted fluence
+    # more than 10 sigma below zero, i.e. a pathological fit rather than a physical one, so this
+    # warns rather than silently clipping. The check needs concrete values, so it is skipped
+    # when the function is traced (under jit); post-processing use is the intended case.
+    try:
+        z_min = float(jnp.min(z))
+        if z_min < _Z_UNDERFLOW_WARN:
+            warnings.warn(
+                f"minimum z = {z_min:.1f} is below {_Z_UNDERFLOW_WARN}: the truncated-normal "
+                f"draw may underflow to a non-finite fluence. Such components have strongly "
+                f"negative fitted fluences and should be inspected rather than trusted.",
+                RuntimeWarning,
+            )
+    except TypeError:
+        pass
 
     # Conditional standard deviation of the fluence
     sigma_A = (s / jnp.sqrt(1.0 + s ** 2)) / snr_opt
