@@ -135,10 +135,20 @@ def sample_pulse_parameters(
     n_pulses: int,
     priors: Dict[str, dist.Distribution],
     time_param: str = "mean_arrival_time",
+    spectral_coeff_map: dict = None,   # ORTHOGONAL SED SUPPORT: remove with the block below if removing orthogonal SED from code
 ) -> Dict[str, jnp.ndarray]:
     """
     Samples every pulse parameter from the prior dictionary into stacked arrays of shape
     (n_pulses,). Arrival times are ordered across pulses; all other parameters are i.i.d.
+
+    spectral_coeff_map: if the orthogonal spectral basis is in use, the conversion coefficients
+                        from `orthogonal_spectral_basis`; gamma and beta are then recorded as
+                        deterministic sites alongside the sampled c1 and c2. Defaults to None,
+                        in which case nothing below the main loop runs.
+
+    TO REMOVE ORTHOGONAL SED SUPPORT: delete the `spectral_coeff_map` argument above, the
+    delimited block below, and the argument and its pass-through in each likelihood in Section 4.
+    Nothing else depends on it.
     """
     if n_pulses > 1 and time_param not in priors:
         raise ValueError(
@@ -154,8 +164,25 @@ def sample_pulse_parameters(
             # Same prior for every pulse, sampled as one batched site
             params_stacked[param_name] = numpyro.sample(param_name, distribution.expand([n_pulses]))
 
-    return params_stacked
+    # ------------------------- BEGIN ORTHOGONAL SED SUPPORT -------------------------
+    # c1 and c2 are coefficients in a basis built from this burst's own channel weights, so they
+    # are not comparable between bursts; gamma and beta are defined identically for every burst
+    # and are what should be reported. Recording them here keeps the conversion in one place.
+    if spectral_coeff_map is not None:
+        missing = {"c1", "c2"} - params_stacked.keys()
+        if missing:
+            raise ValueError(
+                f"spectral_coeff_map was given but {sorted(missing)} not in priors; it applies "
+                f"only when sampling the orthogonal spectral basis."
+            )
+        c1, c2 = params_stacked["c1"], params_stacked["c2"]
+        numpyro.deterministic(
+            "gamma", spectral_coeff_map["gamma_c1"] * c1 + spectral_coeff_map["gamma_c2"] * c2
+        )
+        numpyro.deterministic("beta", spectral_coeff_map["beta_c2"] * c2)
+    # -------------------------- END ORTHOGONAL SED SUPPORT --------------------------
 
+    return params_stacked
 
 def overlap_log_prior(
     R: jnp.ndarray,
@@ -449,6 +476,7 @@ def FD_marg_fullnormal_gaussianlikelihood(
     overlap_R0: float = 0.9,
     overlap_w: float = 0.002,
     time_param: str = "mean_arrival_time",
+    spectral_coeff_map: dict = None,   # ORTHOGONAL SED SUPPORT: remove with the pass-through below if deleting orthog support
 ):
     """
     Fourier-domain Gaussian likelihood with the pulse fluences marginalized analytically using a zero-mean Gaussian prior.
@@ -457,6 +485,9 @@ def FD_marg_fullnormal_gaussianlikelihood(
     sigma_noise: std of the real/imaginary part of each bin, shape (nfreq, 1) or (nfreq, nfourier)
     n_time:      number of time samples N (identifies the Nyquist bin)
     s_opt:       characteristic SNR scale of the fluence prior (scalar or per-pulse)
+    spectral_coeff_map: if the orthogonal spectral basis is in use, the conversion coefficients
+                        from `orthogonal_spectral_basis`; gamma and beta are then recorded as
+                        deterministic sites alongside the sampled c1 and c2.
 
     Fluences must NOT be in priors: templates are evaluated at unit fluence.
     Recover fluences with `draw_fluences_fullnormal_gaussmarg` from the 'gram' and 'rho_mf' sites.
@@ -467,7 +498,8 @@ def FD_marg_fullnormal_gaussianlikelihood(
     _validate_fourier_inputs(data_fd, sigma_noise, n_time)
 
     # Sample shape parameters and evaluate the unit-fluence templates
-    params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
+    #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
+    params_stacked = sample_pulse_parameters(n_pulses, priors, time_param, spectral_coeff_map)
     templates = pulse_templates(params_stacked, single_pulse_fn)
 
     # Restrict to the retained bins (DC and Nyquist discarded; see module docstring)
@@ -504,6 +536,7 @@ def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
     overlap_R0: float = 0.9,
     overlap_w: float = 0.002,
     time_param: str = "mean_arrival_time",
+    spectral_coeff_map: dict = None,   # ORTHOGONAL SED SUPPORT: remove with the pass-through below if deleting orthog support
 ):
     """
     Fourier-domain Gaussian likelihood with the pulse fluences marginalized analytically using a
@@ -513,6 +546,9 @@ def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
     sigma_noise: std of the real/imaginary part of each bin, shape (nfreq, 1) or (nfreq, nfourier)
     n_time:      number of time samples N (identifies the Nyquist bin)
     s_opt:       characteristic SNR scale of the fluence prior (scalar or per-pulse)
+    spectral_coeff_map: if the orthogonal spectral basis is in use, the conversion coefficients
+                        from `orthogonal_spectral_basis`; gamma and beta are then recorded as
+                        deterministic sites alongside the sampled c1 and c2.
 
     Fluences must NOT be in priors: templates are evaluated at unit fluence.
     Recover fluences with `draw_fluences_halfnormal_nooverlap_gaussmarg` from the 'snr_opt' and
@@ -542,7 +578,8 @@ def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
     _validate_fourier_inputs(data_fd, sigma_noise, n_time)
 
     # Sample shape parameters and evaluate the unit-fluence templates
-    params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
+    #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
+    params_stacked = sample_pulse_parameters(n_pulses, priors, time_param, spectral_coeff_map)
     templates = pulse_templates(params_stacked, single_pulse_fn)
 
     # Restrict to the retained bins (DC and Nyquist discarded; see module docstring)
@@ -581,10 +618,14 @@ def FD_gaussian_likelihood(
     priors: Dict[str, dist.Distribution],
     single_pulse_fn: Callable,
     time_param: str = "mean_arrival_time",
+    spectral_coeff_map: dict = None,   # ORTHOGONAL SED SUPPORT: remove with the pass-through below if deleting orthog support
 ):
     """
     Fourier-domain Gaussian likelihood with fluences sampled directly (not marginalized),
     ln p = -1/2 <d - M | d - M>. Useful for validating the marginalized model.
+    spectral_coeff_map: if the orthogonal spectral basis is in use, the conversion coefficients
+                        from `orthogonal_spectral_basis`; gamma and beta are then recorded as
+                        deterministic sites alongside the sampled c1 and c2.
 
     'A' must be in priors, otherwise every fluence would silently default to 1.
     """
@@ -594,7 +635,8 @@ def FD_gaussian_likelihood(
     _validate_fourier_inputs(data_fd, sigma_noise, n_time)
 
     # Sample all parameters and sum the pulses (fluences included)
-    params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
+    #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
+    params_stacked = sample_pulse_parameters(n_pulses, priors, time_param, spectral_coeff_map)
     model_fd = jnp.sum(pulse_templates(params_stacked, single_pulse_fn), axis=0)
 
     # Restrict to the retained bins (DC and Nyquist discarded; see module docstring)
@@ -614,6 +656,7 @@ def TD_gaussian_likelihood(
     single_pulse_fn: Callable,
     dt: float,
     time_param: str = "mean_arrival_time",
+    spectral_coeff_map: dict = None,   # ORTHOGONAL SED SUPPORT: remove with the pass-through below if deleting orthog support
 ):
     """
     Time-domain Gaussian likelihood on the inverse transform of the Fourier-domain model.
@@ -622,7 +665,9 @@ def TD_gaussian_likelihood(
     data_td:        real (nfreq, ntime); must be baseline-subtracted, since this likelihood
                     uses every Fourier bin of the model, including DC
     sigma_noise_td: per-channel time-domain noise std, shape (nfreq, 1)
-
+    spectral_coeff_map: if the orthogonal spectral basis is in use, the conversion coefficients
+                        from `orthogonal_spectral_basis`; gamma and beta are then recorded as
+                        deterministic sites alongside the sampled c1 and c2.
     The model is periodic over the segment (see the wraparound discussion in the paper).
     'A' must be in priors.
     """
@@ -630,7 +675,8 @@ def TD_gaussian_likelihood(
         raise ValueError("'A' must be in priors; otherwise fluences default to 1.")
 
     # Sample all parameters and sum the pulses (fluences included)
-    params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
+    #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
+    params_stacked = sample_pulse_parameters(n_pulses, priors, time_param, spectral_coeff_map)
     model_fd = jnp.sum(pulse_templates(params_stacked, single_pulse_fn), axis=0)
 
     # Inverse of X_c = dt * rfft(x) is x = irfft(X, n=N) / dt

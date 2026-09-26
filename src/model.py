@@ -99,6 +99,35 @@ def running_power_law_sed(params_dict: dict, grid: FDGrid, constants: ModelConst
     F = (grid.normalized_freqs_channels ** kappa) * det_response
     return F
 
+def make_orthogonal_poly_sed(P1: jnp.ndarray, P2: jnp.ndarray) -> Callable:
+    """
+    Builds an SED function in an orthogonal polynomial basis:
+
+        ln F_a = c1 P1(x_a) + c2 P2(x_a),    x_a = ln(nu_a / nu_r)
+
+    rather than ln F_a = gamma x_a + beta x_a^2. P1 and P2 are precomputed by
+    `orthogonal_spectral_basis`, orthogonal to each other and to the constant in the metric set
+    by the per-channel weights. Over a factor-of-two band x and x^2 are nearly parallel, which
+    is what makes gamma and beta strongly degenerate; c1 and c2 are constructed not to be, and
+    orthogonality to the constant also decouples them from the fluence.
+
+    The basis is fixed before sampling, so this is only a change of coordinates: recover gamma
+    and beta afterwards with the coefficients returned alongside P1 and P2. Note that a fixed
+    prior on (c1, c2) implies a different prior on (gamma, beta) than a fixed prior on those
+    would, and that the coefficients are O(1) by construction, so their priors should be too.
+    """
+    P1 = jnp.asarray(P1, dtype=jnp.float32).reshape(-1, 1)
+    P2 = jnp.asarray(P2, dtype=jnp.float32).reshape(-1, 1)
+
+    def orthogonal_poly_sed(params_dict: dict, grid: FDGrid, constants: ModelConstants) -> jnp.ndarray:
+        c1 = jnp.float32(params_dict["c1"])  # coefficient of the linear basis function
+        c2 = jnp.float32(params_dict["c2"])  # coefficient of the quadratic basis function
+        det_response = jnp.float32(constants.det_response)
+
+        return jnp.exp(c1 * P1 + c2 * P2) * det_response
+
+    return orthogonal_poly_sed
+
 
 # -------------------------------------------------------------------
 # 3. Fourier Domain Pulse Functions (T)
