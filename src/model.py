@@ -27,7 +27,7 @@ class ModelConstants:
     k_DM: float = (2.41 * 1e-4)**(-1)  # dispersion constant, pc^-1 * cm^3 * MHz^2 * s
     epsilon: float = -2.0  # Exponent of frequency dependence for pulse dispersion - for now it seems the model only actually allows this to be a constant -2, due to units.
     DM_incoherent: float = 0.0  # DM removed only by incoherent dedispersion (pc cm^-3); contributes to intra-channel smearing. Set to 0 for coherently dedispersed data. Enters only as a sinc width (not a phase), so a large value does not violate the float32 note above.
-    channel_width: float = 0.0  # frequency channel width Delta nu (MHz), channels labeled at their centers; if 0, intra-channel smearing is omitted
+    channel_width: float | jnp.ndarray = 0.0  # frequency channel width Delta nu (MHz), scalar or per-channel (nfreq, 1) after block averaging; channels labeled at their centers; if 0, intra-channel smearing is omitted
 
 
 @dataclass(frozen=True)
@@ -207,7 +207,9 @@ def setup_model(
     """
     ### We are setting up constant values here
     constants = ModelConstants(**constants_dict)
-    if constants.DM_incoherent > 0 and constants.channel_width == 0:
+    # channel_width may be a scalar or a per-channel array (see ModelConstants), so reduce
+    # the comparison before combining it
+    if constants.DM_incoherent > 0 and bool(jnp.all(jnp.asarray(constants.channel_width) == 0)):
         raise ValueError("DM_incoherent > 0 but channel_width = 0: intra-channel smearing would be silently omitted.")
     grid = build_fd_grid(freqs_channels, times, constants)
 
