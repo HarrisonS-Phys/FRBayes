@@ -38,15 +38,26 @@ class FDGrid:
     fourier_freqs: jnp.ndarray  # (1, nfourier)
     t_start: jnp.ndarray  # time array reference offset, needed given FFT conventions
     dt_bin: jnp.ndarray  # time bin width (s); time bins are labeled at their start
+    normalized_freqs_scat: jnp.ndarray = None  # (nu_a / nu_r)^delta; None when delta is sampled per pulse
 
 
-def build_fd_grid(freqs_channels: jnp.ndarray, times: jnp.ndarray, constants: ModelConstants) -> FDGrid:
+def build_fd_grid(
+    freqs_channels: jnp.ndarray,
+    times: jnp.ndarray,
+    constants: ModelConstants,
+    sample_delta: bool = False,
+) -> FDGrid:
     """
     Constructs the Fourier domain evaluation grid.
 
     Note: `times` MUST start near zero (|t_start| <= 1.0 s) so float32 
     does not round away small timing details.
+    sample_delta: if True the scatter-broadening exponent is sampled per pulse, so
+                  (nu_a / nu_r)^delta cannot be built here and is left as None; the pulse model
+                  then computes it from params_dict["delta"] on every evaluation.
     """
+
+    normalized_freqs_scat = None if sample_delta else normalized_freqs ** delta
     # channel frequency array nu_a, shape of (nfreq,1), units of MHz, these are the rows of the model matrix
     freqs_channels = jnp.asarray(freqs_channels, dtype=jnp.float32)
     if freqs_channels.ndim == 1:
@@ -159,8 +170,13 @@ def scattered_gaussian_fd_pulse(params_dict: dict, grid: FDGrid, constants: Mode
 
     mu_a = mean_time_gaussian - grid.t_start
 
-    tau_a = tau_ref * (grid.normalized_freqs_channels ** delta)  # Timescale of scattering-broadening at nu_a
-
+    # Timescale of scattering-broadening at nu_a
+    # delta is sampled per pulse only when the grid was built with sample_delta=True
+    if grid.normalized_freqs_scat is None:
+        tau_a = tau_ref * (grid.normalized_freqs_channels ** jnp.float32(params_dict["delta"]))
+    else:
+        tau_a = tau_ref * grid.normalized_freqs_scat
+    tau_a = tau_ref * (grid.normalized_freqs_channels ** delta)  
     T = jnp.exp(
         -2 * ((jnp.pi ** 2) * (sigma ** 2) * (grid.fourier_freqs) ** 2)
         - 2j * (jnp.pi * grid.fourier_freqs * mu_a)
@@ -197,6 +213,7 @@ def setup_model(
     times: jnp.ndarray,
     sed_fn: Callable = running_power_law_sed,
     pulse_fn: Callable = scattered_gaussian_fd_pulse,
+    sample_delta=False,
 ):
     """
     Setting up the necessary constants for the model itself. The model will be written as a closure within the setup method.
@@ -211,7 +228,7 @@ def setup_model(
     # the comparison before combining it
     if constants.DM_incoherent > 0 and bool(jnp.all(jnp.asarray(constants.channel_width) == 0)):
         raise ValueError("DM_incoherent > 0 but channel_width = 0: intra-channel smearing would be silently omitted.")
-    grid = build_fd_grid(freqs_channels, times, constants)
+    grid = build_fd_grid(freqs_channels, times, constants, sample_delta)
 
     def single_pulse_model(params_dict):
         """
