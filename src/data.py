@@ -49,6 +49,7 @@ class ConditionedData:
     n_time: int  # number of time samples in the segment
     freq_span: jnp.ndarray  # (nfreq,) spread of channel centres within each block (MHz)
     native_dnu: float  # native channel width before averaging (MHz)
+    n_noise_bins: int  # time bins used for the off-pulse noise estimate
 
 
 def block_average_channels(power, freq, n_avg):
@@ -103,7 +104,7 @@ def estimate_noise(data_td, dt, toa=None, exclude_fraction=0.2, noise_fraction=0
 
     Returns (median_noise_td, sigma_noise_td, n_noise_bins), the first two (nfreq, 1). The _td
     suffix marks these as time-domain quantities; prepare_burst converts sigma_noise_td to the
-    Fourier-domain per-bin std, `sigma_noise`, which is what the likelihood uses.
+    Fourier-domain per-bin std, `sigma_noise_fd`, which is what the likelihood uses.
     """
     n_bins = data_td.shape[-1]
 
@@ -234,7 +235,7 @@ def orthogonal_spectral_basis(freq, weights, freq_ref):
     return P1, P2, dict(gamma_c1=a1, gamma_c2=b2, beta_c2=a2)
 
 
-def prepare_burst(path, n_avg=8, fd_downsample=4, toa=None, guard_before=5e-4,
+def prepare_burst(path, n_avg=8, fd_downsample=4, toa=None, exclude_fraction=0.2,
                   noise_fraction=0.2, verbose=True):
     """
     Loads a dedispersed burst and conditions it for the Fourier-domain model.
@@ -250,7 +251,8 @@ def prepare_burst(path, n_avg=8, fd_downsample=4, toa=None, guard_before=5e-4,
     fd_downsample:  keep the lowest 1 / fd_downsample of the Fourier bins
     toa:            burst arrival time (s, relative to the segment start) for the off-pulse
                     noise estimate; see `estimate_noise` for the fallback when it is None
-    guard_before:   excluded ahead of the TOA when estimating the noise (s)
+    exclude_fraction: fraction of the pre-TOA lead-in, nearest the TOA, discarded from the
+                    noise estimate
     noise_fraction: fraction of the segment used for the noise estimate when toa is None
 
     Returns a ConditionedData.
@@ -286,9 +288,6 @@ def prepare_burst(path, n_avg=8, fd_downsample=4, toa=None, guard_before=5e-4,
 
     # Time-domain noise std to the std of the real/imaginary part of each Fourier bin
     sigma_noise_fd = jnp.float32(dt) * sigma_noise_td * jnp.sqrt(n_time / 2.0)
-    sigma_noise_fd = jnp.where(
-        (sigma_noise_fd <= jnp.float32(0.0)) | jnp.isnan(sigma_noise_fd), jnp.inf, sigma_noise_fd
-    )
 
     fourier_freqs_full = jnp.fft.rfftfreq(n_time, d=dt)
     data_fd, fourier_freqs = truncate_fourier(data_fd, fourier_freqs_full, fd_downsample)
@@ -323,6 +322,7 @@ def prepare_burst(path, n_avg=8, fd_downsample=4, toa=None, guard_before=5e-4,
         sigma_noise_td=sigma_noise_td,
         dt=dt,
         n_time=n_time,
+        n_noise_bins=n_noise_bins,
         freq_span=freq_span,
         native_dnu=native_dnu,
     )
