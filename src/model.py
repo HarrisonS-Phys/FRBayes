@@ -49,12 +49,15 @@ class FDGrid:
     bin_transfer: jnp.ndarray = None  # sinc(f_c dt) exp(i pi f_c dt), the time-binning transfer function
 
 
-def build_fd_grid(freqs_channels: jnp.ndarray, times: jnp.ndarray, constants: ModelConstants) -> FDGrid:
+def build_fd_grid(freqs_channels: jnp.ndarray, times: jnp.ndarray, constants: ModelConstants, fourier_freqs=None) -> FDGrid:
     """
     Constructs the Fourier domain evaluation grid.
 
     Note: `times` MUST start near zero (|t_start| <= 1.0 s) so float32 
     does not round away small timing details.
+    fourier_freqs: the Fourier bins the data occupies, from data.py. None rebuilds the full
+                   rfft grid. The model evaluates templates at exactly these frequencies, so
+                   it needs to know nothing about how the data was conditioned.
     """
     # channel frequency array nu_a, shape of (nfreq,1), units of MHz, these are the rows of the model matrix
     freqs_channels = jnp.asarray(freqs_channels, dtype=jnp.float32)
@@ -83,7 +86,12 @@ def build_fd_grid(freqs_channels: jnp.ndarray, times: jnp.ndarray, constants: Mo
     Nseg = times_1d.shape[0]
     dt = times_1d[1] - times_1d[0]
     t_start = times_1d[0]
-    fourier_freqs = jnp.fft.rfftfreq(Nseg, d=dt, dtype=jnp.float32)[None, :] #columns of FD evaluation grid
+
+    #fourier_freqs is columns of FD evaluation grid
+    if fourier_freqs is None:
+        fourier_freqs = jnp.fft.rfftfreq(Nseg, d=dt, dtype=jnp.float32)[None, :]
+    else:
+        fourier_freqs = jnp.asarray(fourier_freqs, dtype=jnp.float32).reshape(1, -1)
 
     ## Parameter-independent factors of the pulse model, built once
     # epsilon is left as a Python int so these lower to integer_pow
@@ -222,6 +230,7 @@ def setup_model(
     times: jnp.ndarray,
     sed_fn: Callable = running_power_law_sed,
     pulse_fn: Callable = scattered_gaussian_fd_pulse,
+    fourier_freqs=None
 ):
     """
     Setting up the necessary constants for the model itself. The model will be written as a closure within the setup method.
@@ -236,7 +245,7 @@ def setup_model(
     # the comparison before combining it
     if constants.DM_incoherent > 0 and bool(jnp.all(jnp.asarray(constants.channel_width) == 0)):
         raise ValueError("DM_incoherent > 0 but channel_width = 0: intra-channel smearing would be silently omitted.")
-    grid = build_fd_grid(freqs_channels, times, constants)
+    grid = build_fd_grid(freqs_channels, times, constants, fourier_freqs)
 
     def single_pulse_model(params_dict):
         """
