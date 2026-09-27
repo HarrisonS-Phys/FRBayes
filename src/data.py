@@ -8,7 +8,7 @@ likelihood need, so neither has to know how the conditioning was done.
 
 CONVENTIONS (must match model.py and likelihood.py):
 1. FOURIER TRANSFORM: d_tilde = dt * rfft(d), so the model's templates share the convention.
-2. NOISE: `sigma_noise` is the standard deviation of the real (equivalently, imaginary) part of
+2. NOISE: `sigma_noise_fd` is the standard deviation of the real (equivalently, imaginary) part of
    each retained Fourier bin, dt * varsigma_a * sqrt(N / 2) for white noise.
 3. RETAINED BINS: DC is dropped, because it is set by each channel's baseline level, which the
    model does not include; the Fourier truncation removes Nyquist along with the rest of the
@@ -26,9 +26,9 @@ import jax.numpy as jnp
 class ConditionedData:
     """Everything the model and likelihood need from a conditioned burst."""
 
-    # --- passed to the likelihood ---
+    # --- passed to the FD likelihood ---
     data_fd: jnp.ndarray  # complex (nfreq, nfourier), dt * rfft of the baseline-subtracted data, retained bins only
-    sigma_noise: jnp.ndarray  # (nfreq, 1) std of the real/imaginary part of each Fourier bin
+    sigma_noise_fd: jnp.ndarray  # (nfreq, 1) std of the real/imaginary part of each Fourier bin
 
     # --- passed to setup_model ---
     freq_channels: jnp.ndarray  # (nfreq, 1) block centre frequencies (MHz)
@@ -37,14 +37,14 @@ class ConditionedData:
     freq_channels_ref: float  # reference frequency nu_r (MHz)
     channel_width: jnp.ndarray  # (nfreq, 1) width of each block (MHz), for intra-channel smearing
 
-    # --- the orthogonal spectral basis ---
+    # --- the orthogonal spectral basis for SED ---
     spectral_basis: Tuple[jnp.ndarray, jnp.ndarray]  # (P1, P2), passed to make_orthogonal_poly_sed
     spectral_coeff_map: dict  # converts sampled c1, c2 back to gamma, beta
     channel_weights: jnp.ndarray  # (nfreq,) metric the basis was orthogonalized in
 
     # --- retained for plotting and diagnostics ---
     data_td: jnp.ndarray  # (nfreq, ntime) baseline-subtracted time-domain data
-    sigma_td: jnp.ndarray  # (nfreq, 1) per-channel time-domain noise std
+    sigma_noise_td: jnp.ndarray  # (nfreq, 1) per-channel time-domain noise std
     dt: float  # time bin width (s)
     n_time: int  # number of time samples in the segment
     freq_span: jnp.ndarray  # (nfreq,) spread of channel centres within each block (MHz)
@@ -79,52 +79,68 @@ def block_average_channels(power, freq, n_avg):
         n_dropped,
     )
 
-
-def estimate_noise(data_td, dt, toa=None, guard_before=5e-4, noise_fraction=0.2, verbose=True):
+def estimate_noise(data_td, dt, toa=None, exclude_fraction=0.2, noise_fraction=0.2, verbose=True):
     """
-    Off-pulse baseline median and MAD estimate of the time-domain noise std per channel.
+    Off-pulse median and MAD estimate of the noise per channel, in the time domain.
 
-    Only bins BEFORE the burst are used. The scattering tail extends after the arrival time and
+    Only bins BEFORE the burst should be used. The scattering tail extends after the arrival time and
     is far longer than the intrinsic width, especially at the bottom of the band, so trailing
     bins cannot be assumed burst-free.
 
-    toa:            burst arrival time (s, relative to the segment start), from an upstream
-                    pipeline. Bins after toa - guard_before are excluded, so the estimate does
-                    not depend on where in the segment the burst happens to sit.
-    guard_before:   excluded ahead of the TOA (s)
-    noise_fraction: fallback when toa is None, using the first fraction of the segment. Only
-                    safe when the burst is known to arrive later than that: a burst inside the
-                    window inflates the noise estimate severalfold, which silently rescales the
-                    likelihood, the channel weights and the meaning of s_opt.
+    toa:              burst arrival time (s, relative to the segment start), from an upstream
+                      pipeline. The interval [0, toa] is the usable lead-in.
+    exclude_fraction: fraction of that lead-in, nearest the TOA, that is discarded. The TOA has
+                      its own uncertainty and the pulse has width, so flux reaches back before
+                      the quoted arrival time; discarding the last part of the lead-in keeps it
+                      out of the noise estimate.
+    noise_fraction:   fallback when toa is None, using the first fraction of the segment. Only
+                      safe when the burst is known to arrive later than that: a burst inside the
+                      window inflates the noise estimate severalfold, which silently rescales
+                      the likelihood, the channel weights and the meaning of s_opt.
 
-    Returns (baseline, sigma_td), both (nfreq, 1).
+    The estimate is always attempted, however few bins are available, and the count is returned
+    so a caller can decide whether it is enough.
+
+    Returns (median_noise_td, sigma_noise_td, n_noise_bins), the first two (nfreq, 1). The _td
+    suffix marks these as time-domain quantities; prepare_burst converts sigma_noise_td to the
+    Fourier-domain per-bin std, `sigma_noise`, which is what the likelihood uses.
     """
     n_bins = data_td.shape[-1]
 
     if toa is None:
-        n_off = int(n_bins * noise_fraction)
+        n_noise_bins = int(n_bins * noise_fraction)
+        method = f"first {noise_fraction:.0%} of the segment"
     else:
-        n_off = int(max((toa - guard_before) / dt, 0))
+        n_noise_bins = int(toa / dt * (1.0 - exclude_fraction))
+        method = f"lead-in before the TOA, less its last {exclude_fraction:.0%}"
 
-    if n_off < 0.05 * n_bins:
-        raise ValueError(
-            f"only {n_off} of {n_bins} bins lie before the burst; the off-pulse region is too "
-            f"short to estimate the noise. Use an earlier toa, a smaller guard_before, or a "
-            f"segment with more lead-in."
-        )
+    n_noise_bins = max(min(n_noise_bins, n_bins), 1)
     if verbose:
-        print(f"noise estimated from the first {n_off} of {n_bins} time bins")
+        print(f"noise estimated from {n_noise_bins} of {n_bins} time bins ({method})")
 
-    off_pulse = data_td[:, :n_off]
+    off_pulse = data_td[:, :n_noise_bins]
 
-    baseline = jnp.median(off_pulse, axis=1, keepdims=True)
-    mad = jnp.median(jnp.abs(off_pulse - baseline), axis=1, keepdims=True)
+    median_noise_td = jnp.median(off_pulse, axis=1, keepdims=True)
+    mad = jnp.median(jnp.abs(off_pulse - median_noise_td), axis=1, keepdims=True)
 
     # 1.4826 = 1 / Phi^-1(3/4), converting the median absolute deviation to a standard deviation
     # for Gaussian noise. MAD is used rather than the sample std so that an unremoved spike or a
     # sliver of burst in the window cannot inflate the estimate.
-    return baseline, mad * 1.4826
+    sigma_noise_td = mad * 1.4826
 
+    # Bad channels are assumed already discarded, so every channel should yield a usable noise
+    # estimate. A non-positive or non-finite value means something upstream is wrong -- a dead
+    # channel left in the file, or a noise window so short that the MAD collapses to zero -- and
+    # it would otherwise propagate silently as an infinite sigma and NaN channel weights.
+    bad = ~(jnp.isfinite(sigma_noise_td) & (sigma_noise_td > 0))
+    if bool(jnp.any(bad)):
+        raise ValueError(
+            f"{int(jnp.sum(bad))} of {sigma_noise_td.size} channels have a non-finite or "
+            f"non-positive noise estimate, from {n_noise_bins} off-pulse bins. Check that bad "
+            f"channels were discarded and that the off-pulse window is long enough."
+        )
+
+    return median_noise_td, sigma_noise_td, n_noise_bins
 
 def truncate_fourier(data_fd, fourier_freqs_full, fd_downsample):
     """
@@ -141,7 +157,7 @@ def truncate_fourier(data_fd, fourier_freqs_full, fd_downsample):
     keep = slice(1, n_keep)
     return data_fd[:, keep], fourier_freqs_full[keep]
 
-def estimate_channel_weights(data_fd, sigma_noise):
+def estimate_channel_weights(data_fd, sigma_noise_fd):
     """
     w_a proportional to (optimal SNR in channel a)^2, normalized to sum to 1.
 
@@ -163,18 +179,15 @@ def estimate_channel_weights(data_fd, sigma_noise):
     need smoothing along the frequency axis; the metric only has to be approximately right.
     """
     d = jnp.asarray(data_fd)
-    s = jnp.asarray(sigma_noise).reshape(-1)
+    s = jnp.asarray(sigma_noise_fd).reshape(-1)
     n_bins = d.shape[-1]
 
-    # Zero-weight any channel whose noise estimate is not usable
-    finite = jnp.isfinite(s) & (s > 0)
-    s_safe = jnp.where(finite, s, 1.0)
-
-    # E|d|^2 = 2 sigma^2 per bin under noise alone, so subtract that to isolate the signal power
-    excess_power = jnp.sum(jnp.abs(d) ** 2, axis=-1) - 2.0 * n_bins * s_safe ** 2
+    # E|d|^2 = 2 sigma^2 per bin under noise alone, so subtract that to isolate the signal power.
+    # estimate_noise guarantees sigma is finite and positive, so no masking is needed here.
+    excess_power = jnp.sum(jnp.abs(d) ** 2, axis=-1) - 2.0 * n_bins * s ** 2
 
     # Negative values are channels consistent with pure noise
-    weights = jnp.where(finite, jnp.maximum(excess_power, 0.0) / s_safe ** 2, 0.0)
+    weights = jnp.maximum(excess_power, 0.0) / s ** 2
 
     return weights / weights.sum()
 
@@ -264,15 +277,17 @@ def prepare_burst(path, n_avg=8, fd_downsample=4, toa=None, guard_before=5e-4,
     n_time = times.shape[0]
     dt = float(times[1] - times[0])
 
-    baseline, sigma_td = estimate_noise(data_td, dt, toa, guard_before, noise_fraction, verbose)
-    data_td = data_td - baseline
+    median_noise_td, sigma_noise_td, n_noise_bins = estimate_noise(
+        data_td, dt, toa, exclude_fraction, noise_fraction, verbose
+    )
+    data_td = data_td - median_noise_td
 
     data_fd = jnp.float32(dt) * jnp.fft.rfft(data_td, axis=-1)
 
     # Time-domain noise std to the std of the real/imaginary part of each Fourier bin
-    sigma_noise = jnp.float32(dt) * sigma_td * jnp.sqrt(n_time / 2.0)
-    sigma_noise = jnp.where(
-        (sigma_noise <= jnp.float32(0.0)) | jnp.isnan(sigma_noise), jnp.inf, sigma_noise
+    sigma_noise_fd = jnp.float32(dt) * sigma_noise_td * jnp.sqrt(n_time / 2.0)
+    sigma_noise_fd = jnp.where(
+        (sigma_noise_fd <= jnp.float32(0.0)) | jnp.isnan(sigma_noise_fd), jnp.inf, sigma_noise_fd
     )
 
     fourier_freqs_full = jnp.fft.rfftfreq(n_time, d=dt)
@@ -282,7 +297,7 @@ def prepare_burst(path, n_avg=8, fd_downsample=4, toa=None, guard_before=5e-4,
               f"(up to {float(fourier_freqs[-1]) / 1e3:.1f} kHz of "
               f"{float(fourier_freqs_full[-1]) / 1e3:.1f} kHz)")
 
-    channel_weights = estimate_channel_weights(data_fd, sigma_noise)
+    channel_weights = estimate_channel_weights(data_fd, sigma_noise_fd)
     freq_channels_ref = dispersion_orthogonal_reference(freq, channel_weights)
     P1, P2, spectral_coeff_map = orthogonal_spectral_basis(freq, channel_weights, freq_channels_ref)
     if verbose:
@@ -295,7 +310,7 @@ def prepare_burst(path, n_avg=8, fd_downsample=4, toa=None, guard_before=5e-4,
 
     return ConditionedData(
         data_fd=data_fd,
-        sigma_noise=sigma_noise,
+        sigma_noise_fd=sigma_noise_fd,
         freq_channels=freq_channels,
         times=times,
         fourier_freqs=fourier_freqs,
@@ -305,7 +320,7 @@ def prepare_burst(path, n_avg=8, fd_downsample=4, toa=None, guard_before=5e-4,
         spectral_coeff_map=spectral_coeff_map,
         channel_weights=channel_weights,
         data_td=data_td,
-        sigma_td=sigma_td,
+        sigma_noise_td=sigma_noise_td,
         dt=dt,
         n_time=n_time,
         freq_span=freq_span,

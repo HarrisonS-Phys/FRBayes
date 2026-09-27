@@ -4,7 +4,7 @@ likelihoods.py - NumPyro likelihoods for the Fourier-domain FRB pulse model.
 CONVENTIONS (must match model.py and the paper):
 1. FOURIER TRANSFORM: data and templates use X_c = dt * sum_b x_b exp(-2 pi i f_c t_b),
    i.e. dt * rfft(x).
-2. NOISE: `sigma_noise` is the standard deviation of the real (equivalently, imaginary) part
+2. NOISE: `sigma_noise_fd` is the standard deviation of the real (equivalently, imaginary) part
    of each Fourier bin. For white noise with per-channel time-domain std varsig_a, this is
    sqrt(N dt^2 varsig_a^2 / 2) for every bin retained below.
 3. DC AND NYQUIST BINS ARE DISCARDED in the Fourier-domain likelihoods:
@@ -39,24 +39,24 @@ _EPS = jnp.finfo(jnp.float32).eps  # floor for SNR_opt in _snr_and_overlaps, gua
 # which sends ndtri to -inf in the truncated-normal draw. See draw_fluences_halfnormal_nooverlap_gaussmarg.
 _Z_UNDERFLOW_WARN = -10.0
 
-def _validate_fourier_inputs(data_fd, sigma_noise):
+def _validate_fourier_inputs(data_fd, sigma_noise_fd):
     """
-    Checks that sigma_noise broadcasts against data_fd. The number of Fourier bins is whatever
+    Checks that sigma_noise_fd broadcasts against data_fd. The number of Fourier bins is whatever
     data.py selected, so there is nothing to validate it against here; the model must be built
     with the matching `fourier_freqs`, which the einsum shapes will catch if it is not.
     """
-    sigma_noise = jnp.asarray(sigma_noise)
-    if sigma_noise.ndim != 2:
+    sigma_noise_fd = jnp.asarray(sigma_noise_fd)
+    if sigma_noise_fd.ndim != 2:
         raise ValueError(
-            f"sigma_noise must be 2D, shape (nfreq, 1) or (nfreq, nfourier); got {sigma_noise.shape}."
+            f"sigma_noise_fd must be 2D, shape (nfreq, 1) or (nfreq, nfourier); got {sigma_noise_fd.shape}."
         )
-    if sigma_noise.shape[0] != data_fd.shape[0]:
+    if sigma_noise_fd.shape[0] != data_fd.shape[0]:
         raise ValueError(
-            f"sigma_noise has {sigma_noise.shape[0]} channels but data_fd has {data_fd.shape[0]}."
+            f"sigma_noise_fd has {sigma_noise_fd.shape[0]} channels but data_fd has {data_fd.shape[0]}."
         )
-    if sigma_noise.shape[1] not in (1, data_fd.shape[-1]):
+    if sigma_noise_fd.shape[1] not in (1, data_fd.shape[-1]):
         raise ValueError(
-            f"sigma_noise has {sigma_noise.shape[1]} Fourier bins; expected 1 (broadcast) "
+            f"sigma_noise_fd has {sigma_noise_fd.shape[1]} Fourier bins; expected 1 (broadcast) "
             f"or {data_fd.shape[-1]} to match data_fd."
         )
 
@@ -221,7 +221,7 @@ def matched_filter_and_gram(
     rho_j = <d|h_j>    unnormalized matched filter, shape (n_pulses,)
     G_jk  = <h_j|h_k>  Gram matrix of template overlaps, shape (n_pulses, n_pulses)
 
-    All inputs are restricted to the retained Fourier bins; inv_var = 1 / sigma_noise^2.
+    All inputs are restricted to the retained Fourier bins; inv_var = 1 / sigma_noise_fd^2.
     """
     weighted = templates * inv_var[None]
     rho = jnp.real(jnp.einsum("jac,ac->j", weighted, jnp.conj(data_fd)))
@@ -455,7 +455,7 @@ def draw_fluences_halfnormal_nooverlap_gaussmarg(
 
 def FD_marg_fullnormal_gaussianlikelihood(
     data_fd: jnp.ndarray,
-    sigma_noise: jnp.ndarray,
+    sigma_noise_fd: jnp.ndarray,
     n_pulses: int,
     priors: Dict[str, dist.Distribution],
     single_pulse_fn: Callable,
@@ -470,7 +470,7 @@ def FD_marg_fullnormal_gaussianlikelihood(
     Fourier-domain Gaussian likelihood with the pulse fluences marginalized analytically using a zero-mean Gaussian prior.
 
     data_fd:     complex (nfreq, nfourier), in the convention of the module docstring
-    sigma_noise: std of the real/imaginary part of each bin, shape (nfreq, 1) or (nfreq, nfourier)
+    sigma_noise_fd: std of the real/imaginary part of each bin, shape (nfreq, 1) or (nfreq, nfourier)
     s_opt:       characteristic SNR scale of the fluence prior (scalar or per-pulse)
     spectral_coeff_map: if the orthogonal spectral basis is in use, the conversion coefficients
                         from `orthogonal_spectral_basis`; gamma and beta are then recorded as
@@ -482,7 +482,7 @@ def FD_marg_fullnormal_gaussianlikelihood(
     if "A" in priors:
         raise ValueError("'A' is marginalized analytically and must not be in priors.")
 
-    _validate_fourier_inputs(data_fd, sigma_noise)
+    _validate_fourier_inputs(data_fd, sigma_noise_fd)
 
     # Sample shape parameters and evaluate the unit-fluence templates
     #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
@@ -490,7 +490,7 @@ def FD_marg_fullnormal_gaussianlikelihood(
     templates = pulse_templates(params_stacked, single_pulse_fn)
 
     # Restrict to the retained bins (DC and Nyquist discarded; see module docstring)
-    sigma = jnp.broadcast_to(jnp.asarray(sigma_noise, dtype=jnp.float32), data_fd.shape)
+    sigma = jnp.broadcast_to(jnp.asarray(sigma_noise_fd, dtype=jnp.float32), data_fd.shape)
     rho, gram = matched_filter_and_gram(templates, data_fd, 1.0 / sigma ** 2)
 
     # Analytic marginalization over the fluences
@@ -511,7 +511,7 @@ def FD_marg_fullnormal_gaussianlikelihood(
 
 def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
     data_fd: jnp.ndarray,
-    sigma_noise: jnp.ndarray,
+    sigma_noise_fd: jnp.ndarray,
     n_pulses: int,
     priors: Dict[str, dist.Distribution],
     single_pulse_fn: Callable,
@@ -528,7 +528,7 @@ def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
     half-normal prior, assuming the pulse components do not overlap.
 
     data_fd:     complex (nfreq, nfourier), in the convention of the module docstring
-    sigma_noise: std of the real/imaginary part of each bin, shape (nfreq, 1) or (nfreq, nfourier)
+    sigma_noise_fd: std of the real/imaginary part of each bin, shape (nfreq, 1) or (nfreq, nfourier)
     s_opt:       characteristic SNR scale of the fluence prior (scalar or per-pulse)
     spectral_coeff_map: if the orthogonal spectral basis is in use, the conversion coefficients
                         from `orthogonal_spectral_basis`; gamma and beta are then recorded as
@@ -559,7 +559,7 @@ def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
     if "A" in priors:
         raise ValueError("'A' is marginalized analytically and must not be in priors.")
 
-    _validate_fourier_inputs(data_fd, sigma_noise)
+    _validate_fourier_inputs(data_fd, sigma_noise_fd)
 
     # Sample shape parameters and evaluate the unit-fluence templates
     #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
@@ -567,7 +567,7 @@ def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
     templates = pulse_templates(params_stacked, single_pulse_fn)
 
     # Restrict to the retained bins (DC and Nyquist discarded; see module docstring)
-    sigma = jnp.broadcast_to(jnp.asarray(sigma_noise, dtype=jnp.float32), data_fd.shape)
+    sigma = jnp.broadcast_to(jnp.asarray(sigma_noise_fd, dtype=jnp.float32), data_fd.shape)
     rho, gram = matched_filter_and_gram(templates, data_fd, 1.0 / sigma ** 2)
 
     # Analytic marginalization over the fluences; only the diagonal of the Gram matrix enters
@@ -595,7 +595,7 @@ def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
 
 def FD_gaussian_likelihood(
     data_fd: jnp.ndarray,
-    sigma_noise: jnp.ndarray,
+    sigma_noise_fd: jnp.ndarray,
     n_pulses: int,
     priors: Dict[str, dist.Distribution],
     single_pulse_fn: Callable,
@@ -614,14 +614,14 @@ def FD_gaussian_likelihood(
     if "A" not in priors:
         raise ValueError("'A' must be in priors; otherwise fluences default to 1.")
 
-    _validate_fourier_inputs(data_fd, sigma_noise)
+    _validate_fourier_inputs(data_fd, sigma_noise_fd)
 
     # Sample all parameters and sum the pulses (fluences included)
     params_stacked = sample_pulse_parameters(n_pulses, priors, time_param, spectral_coeff_map)
     model_fd = jnp.sum(pulse_templates(params_stacked, single_pulse_fn), axis=0)
 
     residual = data_fd - model_fd
-    sigma = jnp.broadcast_to(jnp.asarray(sigma_noise, dtype=jnp.float32), data_fd.shape)
+    sigma = jnp.broadcast_to(jnp.asarray(sigma_noise_fd, dtype=jnp.float32), data_fd.shape)
 
     # Real and imaginary parts are independent with variance sigma^2
     numpyro.factor("log_likelihood", -0.5 * jnp.sum(jnp.abs(residual) ** 2 / sigma ** 2))
