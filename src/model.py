@@ -23,9 +23,9 @@ import jax.numpy as jnp
 class ModelConstants:
     freq_channels_ref: float  # fixed reference / pivot EM frequency nu_r, set approximately equal to frequency of peak emission for a pulse with Gaussian-like SED in the dynamic spectrum element M_kn (MHz)
     det_response: float = 1.0  # TO-DO: WILL BE FUNCTION LATER !!!! Maybe also convolution is involved if frequencies are not independent between channels
-    delta: float = -4.0  # Exponent of frequency dependence for scatter-broadening (tau \propto nu^-4)
+    delta: int | float = -4  # Exponent of frequency dependence for scatter-broadening (tau \propto nu^-4). Kept as a Python int so nu^delta lowers to integer_pow rather than a general pow; it becomes a float32 tracer if delta is sampled instead.
     k_DM: float = (2.41 * 1e-4)**(-1)  # dispersion constant, pc^-1 * cm^3 * MHz^2 * s
-    epsilon: float = -2.0  # Exponent of frequency dependence for pulse dispersion - for now it seems the model only actually allows this to be a constant -2, due to units.
+    epsilon: int | float = -2  # Exponent of frequency dependence for pulse dispersion - for now it seems the model only actually allows this to be a constant -2, due to units. Kept as an int for the same reason as delta.
     DM_incoherent: float = 0.0  # DM removed only by incoherent dedispersion (pc cm^-3); contributes to intra-channel smearing. Set to 0 for coherently dedispersed data. Enters only as a sinc width (not a phase), so a large value does not violate the float32 note above.
     channel_width: float | jnp.ndarray = 0.0  # frequency channel width Delta nu (MHz), scalar or per-channel (nfreq, 1) after block averaging; channels labeled at their centers; if 0, intra-channel smearing is omitted
 
@@ -38,26 +38,24 @@ class FDGrid:
     fourier_freqs: jnp.ndarray  # (1, nfourier)
     t_start: jnp.ndarray  # time array reference offset, needed given FFT conventions
     dt_bin: jnp.ndarray  # time bin width (s); time bins are labeled at their start
-    normalized_freqs_scat: jnp.ndarray = None  # (nu_a / nu_r)^delta; None when delta is sampled per pulse
+
+    # The quantities below depend only on the grid and the model constants, never on sampled
+    # parameters, so they are built once here rather than on every model evaluation. The
+    # scatter-broadening factor (nu_a / nu_r)^delta is NOT among them, since delta may be
+    # sampled; it is evaluated in the pulse model instead.
+    fourier_freqs_sq: jnp.ndarray = None  # f_c^2, for the Gaussian envelope
+    freqs_channels_disp: jnp.ndarray = None  # nu_a^epsilon, for the dispersion delay
+    freq_ref_disp: jnp.ndarray = None  # nu_r^epsilon, the reference frequency's dispersion delay
+    bin_transfer: jnp.ndarray = None  # sinc(f_c dt) exp(i pi f_c dt), the time-binning transfer function
 
 
-def build_fd_grid(
-    freqs_channels: jnp.ndarray,
-    times: jnp.ndarray,
-    constants: ModelConstants,
-    sample_delta: bool = False,
-) -> FDGrid:
+def build_fd_grid(freqs_channels: jnp.ndarray, times: jnp.ndarray, constants: ModelConstants) -> FDGrid:
     """
     Constructs the Fourier domain evaluation grid.
 
     Note: `times` MUST start near zero (|t_start| <= 1.0 s) so float32 
     does not round away small timing details.
-    sample_delta: if True the scatter-broadening exponent is sampled per pulse, so
-                  (nu_a / nu_r)^delta cannot be built here and is left as None; the pulse model
-                  then computes it from params_dict["delta"] on every evaluation.
     """
-
-    normalized_freqs_scat = None if sample_delta else normalized_freqs ** delta
     # channel frequency array nu_a, shape of (nfreq,1), units of MHz, these are the rows of the model matrix
     freqs_channels = jnp.asarray(freqs_channels, dtype=jnp.float32)
     if freqs_channels.ndim == 1:
@@ -87,6 +85,17 @@ def build_fd_grid(
     t_start = times_1d[0]
     fourier_freqs = jnp.fft.rfftfreq(Nseg, d=dt, dtype=jnp.float32)[None, :] #columns of FD evaluation grid
 
+    ## Parameter-independent factors of the pulse model, built once
+    # epsilon is left as a Python int so these lower to integer_pow
+    epsilon = constants.epsilon
+    fourier_freqs_sq = fourier_freqs ** 2
+    freqs_channels_disp = freqs_channels ** epsilon
+    freq_ref_disp = freq_channels_ref ** epsilon
+
+    # Time bins are labeled at their start, so each sample averages over [t_b, t_b + dt_bin]:
+    # the boxcar kernel spans [-dt_bin, 0], giving sinc(f dt_bin) times a half-bin phase shift
+    bin_transfer = jnp.sinc(fourier_freqs * dt) * jnp.exp(1j * jnp.pi * fourier_freqs * dt)
+
     return FDGrid(
         freqs_channels=freqs_channels,
         normalized_freqs_channels=normalized_freqs,
@@ -94,8 +103,11 @@ def build_fd_grid(
         fourier_freqs=fourier_freqs,
         t_start=t_start,
         dt_bin=dt,
+        fourier_freqs_sq=fourier_freqs_sq,
+        freqs_channels_disp=freqs_channels_disp,
+        freq_ref_disp=freq_ref_disp,
+        bin_transfer=bin_transfer,
     )
-
 
 # -------------------------------------------------------------------
 # 2. Spectral Energy Distribution (SED) Functions (F)
@@ -139,7 +151,6 @@ def make_orthogonal_poly_sed(P1: jnp.ndarray, P2: jnp.ndarray) -> Callable:
 
     return orthogonal_poly_sed
 
-
 # -------------------------------------------------------------------
 # 3. Fourier Domain Pulse Functions (T)
 # -------------------------------------------------------------------
@@ -151,34 +162,32 @@ def scattered_gaussian_fd_pulse(params_dict: dict, grid: FDGrid, constants: Mode
     Note: `DM` should be a small residual DM (relative to a dedispersed baseline)
     to avoid float32 rounding errors on large dispersion delays.
     """
-    if constants.epsilon != -2.0:
+    if constants.epsilon != -2:
         raise ValueError("Pulse model valid only for epsilon = -2.")
-    delta = jnp.float32(params_dict.get("delta", constants.delta))  # Exponent of frequency dependence for scatter-broadening
+
+    # delta is taken from params_dict when a prior has been given for it, and is then a float32
+    # tracer; otherwise it comes from constants as a Python int, so the power below lowers to
+    # integer_pow. This is why (nu_a / nu_r)^delta cannot be precomputed in the grid.
+    delta = params_dict.get("delta", constants.delta)
+
     mean_arrival_time = jnp.float32(params_dict["mean_arrival_time"])  # defined so that the pulse peaks at freq_ref at this time (before scatter or dispersion shifts at other frequencies)
     sigma = jnp.float32(params_dict["sigma"])  # width of gaussian in pulse, without scatter-broadening
     DM = jnp.float32(params_dict["DM"])  # dispersion measure, pc/cm^3 (residual DM)
     tau_ref = jnp.float32(params_dict["tau_ref"])  # scatter broadening timescale at freq_ref, if 0 then no scatter is put in the model, s
 
     k_DM = jnp.float32(constants.k_DM)  # dispersion constant, (2.41*1e-4)**(-1) #pc^-1 * cm^3 * MHz^2 * s
-    epsilon = jnp.float32(constants.epsilon)  # Exponent of frequency dependence for pulse dispersion - for now it seems the model only actually allows this to be a constant -2, due to units.
-    freq_channels_ref = jnp.float32(constants.freq_channels_ref) # fixed reference / pivot EM frequency nu_r, set approximately equal to frequency of peak emission for a pulse with Gaussian-like SED in the dynamic spectrum element M_kn
 
     # mean time in the gaussian model with no scatter broadening
     mean_time_gaussian = mean_arrival_time + (
-        k_DM * DM * ((grid.freqs_channels ** epsilon) - (freq_channels_ref ** epsilon))
+        k_DM * DM * (grid.freqs_channels_disp - grid.freq_ref_disp)
     )
 
     mu_a = mean_time_gaussian - grid.t_start
 
-    # Timescale of scattering-broadening at nu_a
-    # delta is sampled per pulse only when the grid was built with sample_delta=True
-    if grid.normalized_freqs_scat is None:
-        tau_a = tau_ref * (grid.normalized_freqs_channels ** jnp.float32(params_dict["delta"]))
-    else:
-        tau_a = tau_ref * grid.normalized_freqs_scat
-    tau_a = tau_ref * (grid.normalized_freqs_channels ** delta)  
+    tau_a = tau_ref * (grid.normalized_freqs_channels ** delta)  # Timescale of scattering-broadening at nu_a
+
     T = jnp.exp(
-        -2 * ((jnp.pi ** 2) * (sigma ** 2) * (grid.fourier_freqs) ** 2)
+        -2 * ((jnp.pi ** 2) * (sigma ** 2) * grid.fourier_freqs_sq)
         - 2j * (jnp.pi * grid.fourier_freqs * mu_a)
     ) / (1 + 2j * jnp.pi * grid.fourier_freqs * tau_a)
 
@@ -188,20 +197,20 @@ def scattered_gaussian_fd_pulse(params_dict: dict, grid: FDGrid, constants: Mode
     channel_width = jnp.float32(constants.channel_width)
 
     # Intra-channel dispersion smearing: delay difference across the channel (assumes epsilon = -2).
+    # Depends on the sampled DM, so unlike the time-binning term it cannot be precomputed.
     # TO-DO: Check this convention -> channels are labeled at their centers, so the smearing boxcar is centered on the channel-center delay (no phase).
     dt_smear = k_DM * (DM_inc + DM) * (
         (2.0 * grid.freqs_channels * channel_width) / ((grid.freqs_channels**2 - (channel_width**2 / 4.0))**2)
     )
     instrmnt_smear_transfer = jnp.sinc(grid.fourier_freqs * dt_smear)
 
-    # To-DO: Check this convention -> time binning: bins are labeled at their start, so each sample averages over [t_b, t_b + dt_bin].
-    # The boxcar kernel spans [-dt_bin, 0], giving sinc(f dt_bin) times a half-bin phase shift.
-    instrmnt_bin_transfer = jnp.sinc(grid.fourier_freqs * grid.dt_bin) * jnp.exp(1j * jnp.pi * grid.fourier_freqs * grid.dt_bin)
+    # Time binning, precomputed in build_fd_grid since it depends only on dt_bin.
+    # To-DO: Check this convention -> bins are labeled at their start, so each sample averages over [t_b, t_b + dt_bin].
+    instrmnt_bin_transfer = grid.bin_transfer
 
     T = T * instrmnt_smear_transfer * instrmnt_bin_transfer
 
     return T
-
 
 # -------------------------------------------------------------------
 # 4. Main Model Orchestrator
@@ -213,7 +222,6 @@ def setup_model(
     times: jnp.ndarray,
     sed_fn: Callable = running_power_law_sed,
     pulse_fn: Callable = scattered_gaussian_fd_pulse,
-    sample_delta=False,
 ):
     """
     Setting up the necessary constants for the model itself. The model will be written as a closure within the setup method.
@@ -228,7 +236,7 @@ def setup_model(
     # the comparison before combining it
     if constants.DM_incoherent > 0 and bool(jnp.all(jnp.asarray(constants.channel_width) == 0)):
         raise ValueError("DM_incoherent > 0 but channel_width = 0: intra-channel smearing would be silently omitted.")
-    grid = build_fd_grid(freqs_channels, times, constants, sample_delta)
+    grid = build_fd_grid(freqs_channels, times, constants)
 
     def single_pulse_model(params_dict):
         """
