@@ -617,13 +617,11 @@ def FD_gaussian_likelihood(
     _validate_fourier_inputs(data_fd, sigma_noise)
 
     # Sample all parameters and sum the pulses (fluences included)
-    #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
     params_stacked = sample_pulse_parameters(n_pulses, priors, time_param, spectral_coeff_map)
     model_fd = jnp.sum(pulse_templates(params_stacked, single_pulse_fn), axis=0)
 
-    # Restrict to the retained bins (DC and Nyquist discarded; see module docstring)
+    residual = data_fd - model_fd
     sigma = jnp.broadcast_to(jnp.asarray(sigma_noise, dtype=jnp.float32), data_fd.shape)
-    rho, gram = matched_filter_and_gram(templates, data_fd, 1.0 / sigma ** 2)
 
     # Real and imaginary parts are independent with variance sigma^2
     numpyro.factor("log_likelihood", -0.5 * jnp.sum(jnp.abs(residual) ** 2 / sigma ** 2))
