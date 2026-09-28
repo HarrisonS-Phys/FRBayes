@@ -593,41 +593,75 @@ def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
 
     numpyro.factor("marginalized_log_likelihood", log_like)
 
-def FD_gaussian_likelihood(
+def FD_gaussianlikelihood(
     data_fd: jnp.ndarray,
     sigma_noise_fd: jnp.ndarray,
     n_pulses: int,
     priors: Dict[str, dist.Distribution],
     single_pulse_fn: Callable,
     time_param: str = "mean_arrival_time",
-    spectral_coeff_map: dict = None,   # ORTHOGONAL SED SUPPORT: remove with the pass-through below if deleting orthog support
+    spectral_coeff_map: dict = None,
 ):
     """
     Fourier-domain Gaussian likelihood with fluences sampled directly (not marginalized),
-    ln p = -1/2 <d - M | d - M>. Useful for validating the marginalized model.
-    spectral_coeff_map: if the orthogonal spectral basis is in use, the conversion coefficients
-                        from `orthogonal_spectral_basis`; gamma and beta are then recorded as
-                        deterministic sites alongside the sampled c1 and c2.
+    ln p = -1/2 <d - M | d - M>.
 
-    'A' must be in priors, otherwise every fluence would silently default to 1.
+    The amplitude is given EITHER as 'A', a fluence, OR as 'A_snr', the amplitude in units of
+    the template's optimal SNR, with the fluence then derived as A = A_snr / SNR_opt. Exactly
+    one of the two must be in priors; which was used is printed at trace time, and is recorded
+    by the priors dictionary itself, which should be stored alongside the samples. Either way
+    the fluence is available afterwards as the 'A' site, so downstream code need not branch.
+
+    'A_snr' makes the prior a conditional one, p(A | theta), whose scale follows the template's
+    detectability: a prior of fixed fluence scale instead penalizes templates in proportion to
+    how detectable they are, biasing recovered widths and scattering timescales toward the more
+    detectable, narrower templates. It is also scale-free, so the same number works for every
+    burst where fluence bounds depend on how the data are normalized, and with
+    dist.HalfNormal(s_opt) it reproduces exactly the prior that
+    FD_marg_halfnormal_nooverlap_Gaussianlikelihood integrates over, making the two comparable.
+
+    The cost is sampling efficiency: SNR_opt depends on the shape parameters, so A_snr couples
+    to them through a ratio and the posterior geometry is worse. 'A' avoids that coupling at the
+    price of a shape-dependent prior. Which is preferable depends on whether the comparison with
+    the marginalized likelihood, or the sampling, matters more for the run at hand.
+
+    'snr_opt' is recorded only in the 'A_snr' case, where it is computed; with 'A' the templates
+    already carry the fluence and the optimal SNR is not formed.
     """
-    if "A" not in priors:
-        raise ValueError("'A' must be in priors; otherwise fluences default to 1.")
+    amplitude_in_snr = "A_snr" in priors
+    if amplitude_in_snr == ("A" in priors):
+        raise ValueError("exactly one of 'A' (a fluence) and 'A_snr' (SNR units) must be in priors.")
+
+    # Fires at trace time, so once per compilation rather than once per likelihood evaluation
+    print(f"sampling the amplitude as {'A_snr (SNR units)' if amplitude_in_snr else 'A (fluence)'}")
 
     _validate_fourier_inputs(data_fd, sigma_noise_fd)
 
-    # Sample all parameters and sum the pulses (fluences included)
     params_stacked = sample_pulse_parameters(n_pulses, priors, time_param, spectral_coeff_map)
-    model_fd = jnp.sum(pulse_templates(params_stacked, single_pulse_fn), axis=0)
+    templates = pulse_templates(params_stacked, single_pulse_fn)
+
+    inv_var = 1.0 / jnp.broadcast_to(jnp.asarray(sigma_noise_fd, dtype=jnp.float32), data_fd.shape) ** 2
+
+    if amplitude_in_snr:
+        # Templates carry unit fluence, since 'A' is absent from the parameter dict, so the
+        # diagonal of the Gram matrix gives SNR_opt. Only the diagonal is needed: O(P N), not O(P^2 N).
+        snr_opt = jnp.sqrt(jnp.maximum(jnp.sum(jnp.abs(templates) ** 2 * inv_var[None], axis=(1, 2)), _EPS))
+        numpyro.deterministic("snr_opt", snr_opt)
+
+        # Fluence is the physical quantity to report; A_snr is specific to this template
+        A = numpyro.deterministic("A", params_stacked["A_snr"] / snr_opt)
+        model_fd = jnp.sum(A[:, None, None] * templates, axis=0)
+    else:
+        # 'A' was in the parameter dict, so the templates already carry the fluence and 'A' is
+        # already a sample site; registering it again as a deterministic would be a name clash
+        model_fd = jnp.sum(templates, axis=0)
 
     residual = data_fd - model_fd
-    sigma = jnp.broadcast_to(jnp.asarray(sigma_noise_fd, dtype=jnp.float32), data_fd.shape)
 
     # Real and imaginary parts are independent with variance sigma^2
-    numpyro.factor("log_likelihood", -0.5 * jnp.sum(jnp.abs(residual) ** 2 / sigma ** 2))
+    numpyro.factor("log_likelihood", -0.5 * jnp.sum(jnp.abs(residual) ** 2 * inv_var))
 
-
-def TD_gaussian_likelihood(
+def TD_gaussianlikelihood(
     data_td: jnp.ndarray,
     sigma_noise_td: jnp.ndarray,
     n_pulses: int,

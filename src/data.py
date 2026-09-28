@@ -27,7 +27,7 @@ class ConditionedData:
     """Everything the model and likelihood need from a conditioned burst."""
 
     # --- passed to the FD likelihood ---
-    data_fd: jnp.ndarray  # complex (nfreq, nfourier), dt * rfft of the baseline-subtracted data, retained bins only
+    data_fd: jnp.ndarray  # complex (nfreq, nfourier), dt * rfft of tmediann-subtracted data, retained bins only
     sigma_noise_fd: jnp.ndarray  # (nfreq, 1) std of the real/imaginary part of each Fourier bin
 
     # --- passed to setup_model ---
@@ -43,7 +43,7 @@ class ConditionedData:
     channel_weights: jnp.ndarray  # (nfreq,) metric the basis was orthogonalized in
 
     # --- retained for plotting and diagnostics ---
-    data_td: jnp.ndarray  # (nfreq, ntime) baseline-subtracted time-domain data
+    data_td: jnp.ndarray  # (nfreq, ntime) median-subtracted time-domain data
     sigma_noise_td: jnp.ndarray  # (nfreq, 1) per-channel time-domain noise std
     dt: float  # time bin width (s)
     n_time: int  # number of time samples in the segment
@@ -235,11 +235,13 @@ def orthogonal_spectral_basis(freq, weights, freq_ref):
     return P1, P2, dict(gamma_c1=a1, gamma_c2=b2, beta_c2=a2)
 
 
-def prepare_burst(path, n_avg=8, fd_downsample=4, toa=None, exclude_fraction=0.2,
+def prepare_burst(path, event_id=None, n_avg=8, fd_downsample=4, toa=None, exclude_fraction=0.2,
                   noise_fraction=0.2, verbose=True):
     """
     Loads a dedispersed burst and conditions it for the Fourier-domain model.
 
+    event_id:       identifier for the burst, carried through to the saved fit so a result can be
+                    traced back to its input. Not used in the conditioning itself.
     path:           .npz holding 'power' (nfreq, ntime), 'freq' (nfreq,), 'time' (ntime,). The
                     data are assumed already dedispersed, and bad channels already DISCARDED
                     rather than marked, so only good channels are present. If bad-channel
@@ -308,6 +310,8 @@ def prepare_burst(path, n_avg=8, fd_downsample=4, toa=None, exclude_fraction=0.2
     channel_width = jnp.asarray(freq_span + native_dnu, dtype=jnp.float32)[:, None]
 
     return ConditionedData(
+        event_id=str(event_id) if event_id else "", 
+        data_path=str(Path(path).resolve()),
         data_fd=data_fd,
         sigma_noise_fd=sigma_noise_fd,
         freq_channels=freq_channels,
