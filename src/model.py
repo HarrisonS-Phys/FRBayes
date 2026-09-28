@@ -262,4 +262,9 @@ def setup_model(
         M = A * F * T
         return M
 
+    # Recorded so a saved fit can say which SED and pulse forms produced it; the returned
+    # closure is always named single_pulse_model, which says nothing about its contents
+    single_pulse_model.sed_fn = sed_fn.__name__
+    single_pulse_model.pulse_fn = pulse_fn.__name__
+
     return single_pulse_model

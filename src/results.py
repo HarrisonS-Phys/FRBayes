@@ -52,7 +52,7 @@ def describe_data(path, event_id=None, n_bytes=None):
         "data.bytes_hashed": str(n_bytes) if n_bytes else "all",
     }
 
-def save_run(path, mcmc, burst, priors, likelihood_name, data_path,
+def save_run(path, mcmc, burst, priors, data_path,
              event_id=None, hash_bytes=None, extra_samples=None, **extra):
     """
     Writes a fit to netcdf: posterior samples, plus the conditioning needed to interpret them.
@@ -61,7 +61,6 @@ def save_run(path, mcmc, burst, priors, likelihood_name, data_path,
                      leading two axes are (chain, draw) with no shape guessing
     burst:           the ConditionedData the fit used
     priors:          the priors dictionary passed to the likelihood
-    likelihood_name: which likelihood was run, since the parameterization differs between them
     data_path:       the file that was analyzed; its contents are hashed, not stored
     extra_samples:   further posterior arrays to store beside the sampled sites, e.g. fluences
                      drawn after a marginalized fit. Each must already be shaped
@@ -88,7 +87,9 @@ def save_run(path, mcmc, burst, priors, likelihood_name, data_path,
     idata.posterior.attrs.update(describe_priors(priors))
     idata.posterior.attrs.update(describe_data(data_path, event_id, hash_bytes))
     idata.posterior.attrs.update({
-        "likelihood": likelihood_name,
+        "likelihood": mcmc.sampler.model.__name__,
+        "sed_fn": getattr(single_pulse_fn, "sed_fn", ""),
+        "pulse_fn": getattr(single_pulse_fn, "pulse_fn", ""),
         "freq_channels_ref": f"{burst.freq_channels_ref:.6f}",
         "n_noise_bins": str(burst.n_noise_bins),
         **{k: str(v) for k, v in extra.items()},
