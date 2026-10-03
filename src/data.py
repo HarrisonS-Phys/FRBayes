@@ -20,6 +20,7 @@ CONVENTIONS (must match model.py and likelihood.py):
 from dataclasses import dataclass
 from typing import Tuple
 import jax.numpy as jnp
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,9 @@ class ConditionedData:
     native_dnu: float  # native channel width before averaging (MHz)
     n_noise_bins: int  # time bins used for the off-pulse noise estimate
 
+    # --- data information ---
+    event_id: str
+    data_path: str
 
 def block_average_channels(power, freq, n_avg):
     """

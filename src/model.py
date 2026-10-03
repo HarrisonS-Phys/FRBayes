@@ -264,6 +264,9 @@ def setup_model(
 
     # Recorded so a saved fit can say which SED and pulse forms produced it; the returned
     # closure is always named single_pulse_model, which says nothing about its contents
+    # constants and grid exposed for convenience
+    single_pulse_model.constants = constants
+    single_pulse_model.grid = grid
     single_pulse_model.sed_fn = sed_fn.__name__
     single_pulse_model.pulse_fn = pulse_fn.__name__
 

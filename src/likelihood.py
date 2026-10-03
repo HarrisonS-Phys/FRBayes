@@ -24,6 +24,7 @@ PRECISION: float32 throughout; see the note in model.py on relative times and re
 from typing import Callable, Dict, Tuple
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.scipy.special import ndtri
 from jax.scipy.stats import norm
 import numpyro
@@ -125,11 +126,141 @@ def sample_ordered_arrival_times(name, distribution, n_pulses):
 
     return numpyro.deterministic(name, t)
 
+def sample_contained_widths(
+    n_pulses: int,
+    extent_max: float,
+    sigma_min: float,
+    bot_over_ref: float,
+    n_sigma: float = 3.0,
+    n_tau: float = 5.0,
+    scattering_index: float = -4.0,
+    flat_in_sigma_tau: bool = True,
+):
+    """
+    Samples the intrinsic width and scattering timescale subject to the pulse fitting inside the
+    segment, which is a single joint condition on the convolved pulse rather than two separate
+    bounds:
+
+        n_sigma * sigma + n_tau * tau_bot <= extent_max
+
+    with tau_bot the scattering timescale at the BOTTOM of the band, where it is longest. Giving
+    sigma and tau independent bounds instead would allow a draw at both maxima, which is twice as
+    wide as intended and wraps around the segment; the Fourier-domain model is periodic, so a
+    pulse that does not fit reappears at the start of the segment.
+
+    Enforced by sampling sigma, then giving the scattering whatever of the budget is left:
+    a box in (sigma, u), so the sampler sees no diagonal boundary. tau -> 0 is reachable at u = 0,
+    which is what an unscattered burst needs.
+
+    extent_max:       the share of the segment allotted to the pulse, xi * W_seg. The rest is for
+                      the dispersion sweep, so it should be consistent with how D_max was set.
+    sigma_min:        narrowest resolvable width, 1 / (2 pi f_max) from the Fourier truncation:
+                      a narrower template has not rolled off within the retained bins, so the
+                      data do not constrain it and the sampler would wander.
+    bot_over_ref:     nu_bot / nu_r, converting tau at the bottom of the band to tau_ref
+    n_sigma, n_tau:   how many widths and e-folds must fit. 3 leaves 0.1% of the Gaussian and 5
+                      leaves 0.7% of the exponential outside the window.
+    flat_in_sigma_tau: the construction is flat in the SAMPLED coordinates (sigma, tau_frac).
+                      That is not flat in the PHYSICAL ones (sigma, tau), because tau_frac is a
+                      fraction of a budget that shrinks as sigma grows: a wide pulse has less of
+                      the segment left for its tail, so its tau is squeezed into a shorter range
+                      and its density there is correspondingly higher. True by default, which
+                      adds a Jacobian factor cancelling that, giving a prior flat in (sigma, tau)
+                      over the allowed region. Set False to leave the prior flat in (sigma,
+                      tau_frac) instead, i.e. to treat the fraction rather than the timescale as
+                      the quantity with the uniform prior.
+
+    Returns (sigma, tau_ref), both shape (n_pulses,). 'tau_ref' and 'tau_bot' are recorded as
+    deterministic sites; 'sigma' and 'tau_frac' are the sampled ones.
+    """
+    sigma = numpyro.sample(
+        "sigma", dist.Uniform(sigma_min, extent_max / n_sigma).expand([n_pulses])
+    )
+    tau_frac = numpyro.sample("tau_frac", dist.Uniform(0.0, 1.0).expand([n_pulses]))
+
+    # Whatever of the containment budget the width has not used
+    budget = extent_max - n_sigma * sigma
+    tau_bot = tau_frac * budget / n_tau
+
+    numpyro.deterministic("tau_bot", tau_bot)
+    tau_ref = numpyro.deterministic(
+        "tau_ref", tau_bot * jnp.float32(bot_over_ref) ** (-jnp.float32(scattering_index))
+    )
+
+    if flat_in_sigma_tau:
+        # d(tau) / d(tau_frac) = budget / n_tau, so adding its log cancels the varying width of
+        # tau's conditional range and leaves the prior flat in (sigma, tau)
+        numpyro.factor("width_containment_jacobian", jnp.sum(jnp.log(budget / n_tau)))
+
+    return sigma, tau_ref
+
+def sample_contained_lowestFDbin(
+    params_stacked: Dict[str, jnp.ndarray],
+    single_pulse_fn_low: Callable,
+    inv_var: jnp.ndarray,
+    ratio_min: float = 0.9,
+    K: float = 100.0,
+    w: float = 0.01,
+) -> jnp.ndarray:
+    """
+    Penalizes the model having power below the segment's fundamental frequency, which is the
+    power that wraps around in a periodic Fourier-domain model.
+
+    The statistic is the noise-weighted power of the summed model at the lowest resolvable
+    frequency f1 = 1 / W_seg, relative to its power at f1 / 2:
+
+        ratio = sqrt( sum_a |M_a(f1)|^2 / sigma_a^2  /  sum_a |M_a(f1/2)|^2 / sigma_a^2 )
+
+    A pulse comfortably shorter than the segment has an envelope that is nearly flat between
+    f1/2 and f1, giving a ratio near 1; a pulse whose structure approaches the segment length has
+    begun to roll off there, and the ratio falls.
+
+    Two properties make this preferable to bounding sigma and tau separately. It is agnostic to
+    which parameter put power at long timescales, so it catches any configuration that wraps
+    rather than only the ones a width-plus-scattering rule anticipates. And because it is applied
+    to the full model rather than the temporal shape alone, the sum over channels is weighted by
+    the SED: a channel whose scattering tail is long but which carries no flux cannot dominate,
+    since what wraps is flux rather than timescale.
+
+        ln p = -K / softplus(ratio_min / w) * softplus((ratio_min - ratio) / w)
+
+    Flat above `ratio_min` and falling below it, with K the penalty at ratio = 0. The useful
+    range of the statistic is narrow -- 0.95 admits about 2e-4 of the flux beyond half a segment,
+    0.75 admits 7% -- so thresholds between roughly 0.85 and 0.95 are the meaningful ones, and w
+    of order 0.01 rather than the much sharper value used for the overlap prior.
+
+    Being a penalty rather than a bound, a burst too scattered for the segment is not forbidden
+    but pushed against the threshold: the recorded 'wraparound_ratio' piling up at `ratio_min` is
+    the signal to re-extract with a longer segment, in place of a parameter railing.
+
+    params_stacked:      the sampled pulse parameters, as returned by sample_pulse_parameters
+    single_pulse_fn_low: a model closure built on the two-frequency grid [f1/2, f1]
+    inv_var:             1 / sigma_noise_fd^2, shape (nfreq, 1)
+
+    Returns the ratio, also recorded as the 'wraparound_ratio' site.
+    """
+    models = jax.vmap(single_pulse_fn_low)(params_stacked)
+    model = jnp.sum(models, axis=0)  # (nfreq, 2), columns [f1/2, f1]
+
+    power_ref = jnp.sum(jnp.abs(model[:, 0]) ** 2 * inv_var[:, 0])
+    power_low = jnp.sum(jnp.abs(model[:, 1]) ** 2 * inv_var[:, 0])
+    ratio = jnp.sqrt(power_low / jnp.maximum(power_ref, _EPS))
+
+    numpyro.deterministic("wraparound_ratio", ratio)
+
+    # Normalized so K is the penalty at ratio = 0, matching overlap_log_prior's convention
+    normalization = jax.nn.softplus(ratio_min / w)
+    numpyro.factor(
+        "wraparound_prior", -(K / normalization) * jax.nn.softplus((ratio_min - ratio) / w)
+    )
+    return ratio
+
 def sample_pulse_parameters(
     n_pulses: int,
     priors: Dict[str, dist.Distribution],
     time_param: str = "mean_arrival_time",
-    spectral_coeff_map: dict = None,   # ORTHOGONAL SED SUPPORT: remove with the block below if removing orthogonal SED from code
+    containment: dict = None,          # WIDTH CONTAINMENT SUPPORT: remove with the block below
+    spectral_coeff_map: dict = None,   # ORTHOGONAL SED SUPPORT: remove with the block below
 ) -> Dict[str, jnp.ndarray]:
     """
     Samples every pulse parameter from the prior dictionary into stacked arrays of shape
@@ -138,11 +269,16 @@ def sample_pulse_parameters(
     spectral_coeff_map: if the orthogonal spectral basis is in use, the conversion coefficients
                         from `orthogonal_spectral_basis`; gamma and beta are then recorded as
                         deterministic sites alongside the sampled c1 and c2. Defaults to None,
-                        in which case nothing below the main loop runs.
+                        in which case nothing in that block runs.
+    containment:        if given, sigma and tau_ref are drawn jointly so the pulse fits inside
+                        the segment (see `sample_contained_widths`) rather than from independent
+                        priors; 'sigma' and 'tau_ref' must then be absent from `priors`. Passed
+                        through as keyword arguments, so it can also override n_sigma, n_tau and
+                        flat_in_sigma_tau.
 
-    TO REMOVE ORTHOGONAL SED SUPPORT: delete the `spectral_coeff_map` argument above, the
+    TO REMOVE ORTHOGONAL SED SUPPORT: delete the `spectral_coeff_map` argument above, its
     delimited block below, and the argument and its pass-through in each likelihood in Section 4.
-    Nothing else depends on it.
+    The same applies to `containment`. Nothing else depends on either.
     """
     if n_pulses > 1 and time_param not in priors:
         raise ValueError(
@@ -175,6 +311,31 @@ def sample_pulse_parameters(
         )
         numpyro.deterministic("beta", spectral_coeff_map["beta_c2"] * c2)
     # -------------------------- END ORTHOGONAL SED SUPPORT --------------------------
+
+    # ------------------------ BEGIN WIDTH CONTAINMENT SUPPORT ------------------------
+    # sigma and tau_ref are coupled by the requirement that the pulse fit inside the segment, so
+    # they cannot be expressed as independent entries in `priors` and are drawn here instead.
+    # `containment["method"]` selects how containment is imposed; the remaining entries are the
+    # arguments of that method, which differ between them.
+    if containment is not None:
+        clash = {"sigma", "tau_ref"} & priors.keys()
+        if clash:
+            raise ValueError(
+                f"{sorted(clash)} must not be in priors when `containment` is given; the widths "
+                f"are drawn jointly by the containment method."
+            )
+
+        methods = {
+            "sample_contained_widths": sample_contained_widths,        # n_sigma widths + n_tau e-folds fit in the segment
+            "sample_contained_lowestFDbin": sample_contained_lowestFDbin,  # template envelope survives at f = 1 / segment
+        }
+        settings = dict(containment)
+        method = settings.pop("method", "lowest_fd_bin")
+        if method not in methods:
+            raise ValueError(f"unknown containment method '{method}'; expected one of {sorted(methods)}.")
+
+        params_stacked["sigma"], params_stacked["tau_ref"] = methods[method](n_pulses, **settings)
+    # ------------------------- END WIDTH CONTAINMENT SUPPORT -------------------------
 
     return params_stacked
 
@@ -464,6 +625,7 @@ def FD_marg_fullnormal_gaussianlikelihood(
     overlap_R0: float = 0.9,
     overlap_w: float = 0.002,
     time_param: str = "mean_arrival_time",
+    containment: dict = None, #support for contained pulse priors within data segment, remove with pass-through below if deleting
     spectral_coeff_map: dict = None,   # ORTHOGONAL SED SUPPORT: remove with the pass-through below if deleting orthog support
 ):
     """
@@ -475,6 +637,9 @@ def FD_marg_fullnormal_gaussianlikelihood(
     spectral_coeff_map: if the orthogonal spectral basis is in use, the conversion coefficients
                         from `orthogonal_spectral_basis`; gamma and beta are then recorded as
                         deterministic sites alongside the sampled c1 and c2.
+    containment:    if given, sigma and tau_ref are drawn jointly so the pulse fits inside the
+                    segment (see `sample_contained_widths`) rather than from independent priors;
+                    'sigma' and 'tau_ref' must then be absent from `priors`.
 
     Fluences must NOT be in priors: templates are evaluated at unit fluence.
     Recover fluences with `draw_fluences_fullnormal_gaussmarg` from the 'gram' and 'rho_mf' sites.
@@ -486,7 +651,11 @@ def FD_marg_fullnormal_gaussianlikelihood(
 
     # Sample shape parameters and evaluate the unit-fluence templates
     #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
-    params_stacked = sample_pulse_parameters(n_pulses, priors, time_param, spectral_coeff_map)
+    #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param, spectral_coeff_map)
+    params_stacked = sample_pulse_parameters(
+        n_pulses, priors, time_param,
+        spectral_coeff_map=spectral_coeff_map, containment=containment,
+    )
     templates = pulse_templates(params_stacked, single_pulse_fn)
 
     # Restrict to the retained bins (DC and Nyquist discarded; see module docstring)
@@ -521,6 +690,7 @@ def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
     overlap_R0: float = 0.9,
     overlap_w: float = 0.002,
     time_param: str = "mean_arrival_time",
+    containment: dict = None, #support for contained pulse priors within data segment, remove with pass-through below if deleting
     spectral_coeff_map: dict = None,   # ORTHOGONAL SED SUPPORT: remove with the pass-through below if deleting orthog support
 ):
     """
@@ -533,6 +703,9 @@ def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
     spectral_coeff_map: if the orthogonal spectral basis is in use, the conversion coefficients
                         from `orthogonal_spectral_basis`; gamma and beta are then recorded as
                         deterministic sites alongside the sampled c1 and c2.
+    containment:    if given, sigma and tau_ref are drawn jointly so the pulse fits inside the
+                    segment (see `sample_contained_widths`) rather than from independent priors;
+                    'sigma' and 'tau_ref' must then be absent from `priors`.
 
     Fluences must NOT be in priors: templates are evaluated at unit fluence.
     Recover fluences with `draw_fluences_halfnormal_nooverlap_gaussmarg` from the 'snr_opt' and
@@ -563,7 +736,11 @@ def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
 
     # Sample shape parameters and evaluate the unit-fluence templates
     #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
-    params_stacked = sample_pulse_parameters(n_pulses, priors, time_param, spectral_coeff_map)
+    #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param, spectral_coeff_map)
+    params_stacked = sample_pulse_parameters(
+        n_pulses, priors, time_param,
+        spectral_coeff_map=spectral_coeff_map, containment=containment,
+    )
     templates = pulse_templates(params_stacked, single_pulse_fn)
 
     # Restrict to the retained bins (DC and Nyquist discarded; see module docstring)
@@ -600,6 +777,8 @@ def FD_gaussianlikelihood(
     priors: Dict[str, dist.Distribution],
     single_pulse_fn: Callable,
     time_param: str = "mean_arrival_time",
+    containment: dict = None, #support for contained pulse priors within data segment, remove with pass-through below if deleting
+    containment_FD: dict = None,
     spectral_coeff_map: dict = None,
 ):
     """
@@ -637,7 +816,13 @@ def FD_gaussianlikelihood(
 
     _validate_fourier_inputs(data_fd, sigma_noise_fd)
 
-    params_stacked = sample_pulse_parameters(n_pulses, priors, time_param, spectral_coeff_map)
+    #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param, spectral_coeff_map)
+    params_stacked = sample_pulse_parameters(
+        n_pulses, priors, time_param,
+        spectral_coeff_map=spectral_coeff_map, containment=containment,
+    )
+    if containment_FD is not None:
+        sample_contained_lowestFDbin(params_stacked, **containment_FD)
     templates = pulse_templates(params_stacked, single_pulse_fn)
 
     inv_var = 1.0 / jnp.broadcast_to(jnp.asarray(sigma_noise_fd, dtype=jnp.float32), data_fd.shape) ** 2
@@ -669,6 +854,7 @@ def TD_gaussianlikelihood(
     single_pulse_fn: Callable,
     dt: float,
     time_param: str = "mean_arrival_time",
+    containment: dict = None, #support for contained pulse priors within data segment, remove with pass-through below if deleting
     spectral_coeff_map: dict = None,   # ORTHOGONAL SED SUPPORT: remove with the pass-through below if deleting orthog support
 ):
     """
@@ -681,6 +867,9 @@ def TD_gaussianlikelihood(
     spectral_coeff_map: if the orthogonal spectral basis is in use, the conversion coefficients
                         from `orthogonal_spectral_basis`; gamma and beta are then recorded as
                         deterministic sites alongside the sampled c1 and c2.
+    containment:    if given, sigma and tau_ref are drawn jointly so the pulse fits inside the
+                    segment (see `sample_contained_widths`) rather than from independent priors;
+                    'sigma' and 'tau_ref' must then be absent from `priors`.
     The model is periodic over the segment (see the wraparound discussion in the paper).
     'A' must be in priors.
     """
@@ -689,7 +878,11 @@ def TD_gaussianlikelihood(
 
     # Sample all parameters and sum the pulses (fluences included)
     #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
-    params_stacked = sample_pulse_parameters(n_pulses, priors, time_param, spectral_coeff_map)
+    #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param, spectral_coeff_map)
+    params_stacked = sample_pulse_parameters(
+        n_pulses, priors, time_param,
+        spectral_coeff_map=spectral_coeff_map, containment=containment,
+    )
     model_fd = jnp.sum(pulse_templates(params_stacked, single_pulse_fn), axis=0)
 
     # Inverse of X_c = dt * rfft(x) is x = irfft(X, n=N) / dt
