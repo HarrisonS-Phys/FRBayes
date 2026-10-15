@@ -197,7 +197,7 @@ def sample_contained_widths(
 def sample_contained_lowestFDbin(
     params_stacked: Dict[str, jnp.ndarray],
     single_pulse_fn_low: Callable,
-    inv_var: jnp.ndarray,
+    inv_noise_var: jnp.ndarray,
     ratio_min: float = 0.9,
     K: float = 100.0,
     w: float = 0.01,
@@ -235,15 +235,15 @@ def sample_contained_lowestFDbin(
 
     params_stacked:      the sampled pulse parameters, as returned by sample_pulse_parameters
     single_pulse_fn_low: a model closure built on the two-frequency grid [f1/2, f1]
-    inv_var:             1 / sigma_noise_fd^2, shape (nfreq, 1)
+    inv_noise_var:             1 / sigma_noise_fd^2, shape (nfreq, 1)
 
     Returns the ratio, also recorded as the 'wraparound_ratio' site.
     """
     models = jax.vmap(single_pulse_fn_low)(params_stacked)
     model = jnp.sum(models, axis=0)  # (nfreq, 2), columns [f1/2, f1]
 
-    power_ref = jnp.sum(jnp.abs(model[:, 0]) ** 2 * inv_var[:, 0])
-    power_low = jnp.sum(jnp.abs(model[:, 1]) ** 2 * inv_var[:, 0])
+    power_ref = jnp.sum(jnp.abs(model[:, 0]) ** 2 * inv_noise_var[:, 0])
+    power_low = jnp.sum(jnp.abs(model[:, 1]) ** 2 * inv_noise_var[:, 0])
     ratio = jnp.sqrt(power_low / jnp.maximum(power_ref, _EPS))
 
     numpyro.deterministic("wraparound_ratio", ratio)
@@ -376,15 +376,15 @@ def pulse_templates(
 def matched_filter_and_gram(
     templates: jnp.ndarray,
     data_fd: jnp.ndarray,
-    inv_var: jnp.ndarray,
+    inv_noise_var: jnp.ndarray,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     rho_j = <d|h_j>    unnormalized matched filter, shape (n_pulses,)
     G_jk  = <h_j|h_k>  Gram matrix of template overlaps, shape (n_pulses, n_pulses)
 
-    All inputs are restricted to the retained Fourier bins; inv_var = 1 / sigma_noise_fd^2.
+    All inputs are restricted to the retained Fourier bins; inv_noise_var = 1 / sigma_noise_fd^2.
     """
-    weighted = templates * inv_var[None]
+    weighted = templates * inv_noise_var[None]
     rho = jnp.real(jnp.einsum("jac,ac->j", weighted, jnp.conj(data_fd)))
     gram = jnp.real(jnp.einsum("jac,kac->jk", jnp.conj(templates), weighted))
 
@@ -825,12 +825,12 @@ def FD_gaussianlikelihood(
         sample_contained_lowestFDbin(params_stacked, **containment_FD)
     templates = pulse_templates(params_stacked, single_pulse_fn)
 
-    inv_var = 1.0 / jnp.broadcast_to(jnp.asarray(sigma_noise_fd, dtype=jnp.float32), data_fd.shape) ** 2
+    inv_noise_var = 1.0 / jnp.broadcast_to(jnp.asarray(sigma_noise_fd, dtype=jnp.float32), data_fd.shape) ** 2
 
     if amplitude_in_snr:
         # Templates carry unit fluence, since 'A' is absent from the parameter dict, so the
         # diagonal of the Gram matrix gives SNR_opt. Only the diagonal is needed: O(P N), not O(P^2 N).
-        snr_opt = jnp.sqrt(jnp.maximum(jnp.sum(jnp.abs(templates) ** 2 * inv_var[None], axis=(1, 2)), _EPS))
+        snr_opt = jnp.sqrt(jnp.maximum(jnp.sum(jnp.abs(templates) ** 2 * inv_noise_var[None], axis=(1, 2)), _EPS))
         numpyro.deterministic("snr_opt", snr_opt)
 
         # Fluence is the physical quantity to report; A_snr is specific to this template
@@ -844,7 +844,7 @@ def FD_gaussianlikelihood(
     residual = data_fd - model_fd
 
     # Real and imaginary parts are independent with variance sigma^2
-    numpyro.factor("log_likelihood", -0.5 * jnp.sum(jnp.abs(residual) ** 2 * inv_var))
+    numpyro.factor("log_likelihood", -0.5 * jnp.sum(jnp.abs(residual) ** 2 * inv_noise_var))
 
 def TD_gaussianlikelihood(
     data_td: jnp.ndarray,
