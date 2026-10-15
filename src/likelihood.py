@@ -427,20 +427,6 @@ def fullnormal_gaussmarg_log_likelihood(
     Returns (log_likelihood, R, snr_opt, snr_mf).
     """
     snr_opt, snr_mf, R = _snr_and_overlaps(rho, gram)
-    if containment_FD is not None:
-        # The fluences are integrated out, so the wraparound ratio, which depends on their
-        # relative sizes, has no per-draw amplitude to use. We plug in the conditional mean
-        # E[A | theta, d], which here is closed-form and nearly free: the conditional is the
-        # Gaussian N([R + diag(s_opt^-2)]^-1 SNR_mf, ...) in SNR units, so its mean is one
-        # Cholesky solve on an n_pulses x n_pulses matrix, divided by SNR_opt to give fluence.
-        # Exact for a single pulse, where the amplitude cancels from the ratio. For several
-        # pulses it is a plug-in approximation, and because the conditional mean depends on the
-        # data, the penalty is then a data-dependent soft constraint rather than a strict prior.
-        # The exact ratio is computed after sampling from the drawn fluences.
-        chol, _ = _gaussian_fluence_prior_cholesky(R, s_opt)
-        A_approx = jax.scipy.linalg.cho_solve((chol, True), snr_mf) / snr_opt
-        wraparound_ratio(params_stacked, single_pulse_fn, A_approx, inv_noise_var,
-                         containment_FD, site_name="wraparound_ratio_realtime_approx")
     chol, s_opt_broadcast = _gaussian_fluence_prior_cholesky(R, s_opt)
 
     # Quadratic term via a triangular solve rather than an explicit inverse
@@ -476,23 +462,6 @@ def halfnormal_nooverlap_gaussmarg_log_likelihood(
     Returns (log_likelihood, R, snr_opt, snr_mf).
     """
     snr_opt, snr_mf, R = _snr_and_overlaps(rho, gram)
-    if containment_FD is not None:
-        # The fluences are integrated out, so the wraparound ratio, which depends on their
-        # relative sizes, has no per-draw amplitude to use. We plug in the conditional mean
-        # E[A | theta, d], which here is closed-form and nearly free: under the half-normal prior
-        # and non-overlap, each A_j is an independent normal truncated to A > 0, with location
-        # z_j sigma_A,j, so its mean is sigma_A,j [z_j + phi(z_j) / Phi(z_j)]. The ratio
-        # phi / Phi is evaluated in log space so it stays finite for negative z.
-        # Exact for a single pulse, where the amplitude cancels from the ratio. For several
-        # pulses it is a plug-in approximation, and because the conditional mean depends on the
-        # data, the penalty is then a data-dependent soft constraint rather than a strict prior.
-        # The exact ratio is computed after sampling from the drawn fluences.
-        s = jnp.broadcast_to(jnp.asarray(s_opt, dtype=snr_mf.dtype), (n_pulses,))
-        z = s * snr_mf / jnp.sqrt(1.0 + s ** 2)
-        sigma_A = (s / jnp.sqrt(1.0 + s ** 2)) / snr_opt
-        A_approx = sigma_A * (z + jnp.exp(norm.logpdf(z) - norm.logcdf(z)))
-        wraparound_ratio(params_stacked, single_pulse_fn, A_approx, inv_noise_var,
-                         containment_FD, site_name="wraparound_ratio_realtime_approx")
     s_opt_broadcast = jnp.broadcast_to(jnp.asarray(s_opt, dtype=jnp.float32), rho.shape)
 
     z = s_opt_broadcast * snr_mf / jnp.sqrt(1.0 + s_opt_broadcast ** 2)
@@ -645,7 +614,8 @@ def FD_marg_fullnormal_gaussianlikelihood(
     overlap_R0: float = 0.9,
     overlap_w: float = 0.002,
     time_param: str = "mean_arrival_time",
-    containment_FD: dict = None, #support for contained pulse priors within data segment, remove with pass-through below if deleting
+    containment: dict = None, #support for contained pulse priors within data segment, remove with pass-through below if deleting
+    containment_FD: dict = None,
     spectral_coeff_map: dict = None,   # ORTHOGONAL SED SUPPORT: remove with the pass-through below if deleting orthog support
 ):
     """
@@ -657,9 +627,14 @@ def FD_marg_fullnormal_gaussianlikelihood(
     spectral_coeff_map: if the orthogonal spectral basis is in use, the conversion coefficients
                         from `orthogonal_spectral_basis`; gamma and beta are then recorded as
                         deterministic sites alongside the sampled c1 and c2.
-    containment_FD:    if given, sigma and tau_ref are drawn jointly so the pulse fits inside the
+    containment:    if given, sigma and tau_ref are drawn jointly so the pulse fits inside the
                     segment (see `sample_contained_widths`) rather than from independent priors;
                     'sigma' and 'tau_ref' must then be absent from `priors`.
+    containment_FD: if given, dict(ratio_min, K, w), the wraparound penalty is applied during
+                    sampling, with the ratio evaluated at the conditional-mean fluences and
+                    recorded as 'wraparound_ratio_realtime_approx'. If None, nothing
+                    wraparound-related is computed during sampling; compute the exact ratio
+                    afterwards with `wraparound_ratio_posthoc` from the drawn fluences.
 
     Fluences must NOT be in priors: templates are evaluated at unit fluence.
     Recover fluences with `draw_fluences_fullnormal_gaussmarg` from the 'gram' and 'rho_mf' sites.
@@ -680,10 +655,27 @@ def FD_marg_fullnormal_gaussianlikelihood(
 
     # Restrict to the retained bins (DC and Nyquist discarded; see module docstring)
     sigma = jnp.broadcast_to(jnp.asarray(sigma_noise_fd, dtype=jnp.float32), data_fd.shape)
-    rho, gram = matched_filter_and_gram(templates, data_fd, 1.0 / sigma ** 2)
+    inv_noise_var = 1.0 / sigma ** 2
+    rho, gram = matched_filter_and_gram(templates, data_fd, inv_noise_var)
 
     # Analytic marginalization over the fluences
     log_like, R, snr_opt, snr_mf = fullnormal_gaussmarg_log_likelihood(rho, gram, s_opt)
+
+    # Wraparound penalty, only if requested; otherwise the exact ratio is computed post-hoc
+    if containment_FD is not None:
+        # The fluences are integrated out, so the wraparound ratio, which depends on their
+        # relative sizes, has no per-draw amplitude to use. We plug in the conditional mean
+        # E[A | theta, d], which here is closed-form and nearly free: the conditional is the
+        # Gaussian N([R + diag(s_opt^-2)]^-1 SNR_mf, ...) in SNR units, so its mean is one
+        # Cholesky solve on an n_pulses x n_pulses matrix, divided by SNR_opt to give fluence.
+        # Exact for a single pulse, where the amplitude cancels from the ratio. For several
+        # pulses it is a plug-in approximation, and because the conditional mean depends on the
+        # data, the penalty is then a data-dependent soft constraint rather than a strict prior.
+        # The exact ratio is computed after sampling from the drawn fluences.
+        chol, _ = _gaussian_fluence_prior_cholesky(R, s_opt)
+        A_approx = jax.scipy.linalg.cho_solve((chol, True), snr_mf) / snr_opt
+        wraparound_ratio(params_stacked, single_pulse_fn, A_approx, inv_noise_var,
+                         containment_FD, site_name="wraparound_ratio_realtime_approx")
 
     # Stored per sample so fluences can be drawn afterwards without re-evaluating templates
     numpyro.deterministic("gram", gram)
@@ -727,6 +719,11 @@ def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
     containment:    if given, sigma and tau_ref are drawn jointly so the pulse fits inside the
                     segment (see `sample_contained_widths`) rather than from independent priors;
                     'sigma' and 'tau_ref' must then be absent from `priors`.
+    containment_FD: if given, dict(ratio_min, K, w), the wraparound penalty is applied during
+                    sampling, with the ratio evaluated at the conditional-mean fluences and
+                    recorded as 'wraparound_ratio_realtime_approx'. If None, nothing
+                    wraparound-related is computed during sampling; compute the exact ratio
+                    afterwards with `wraparound_ratio_posthoc` from the drawn fluences.
 
     Fluences must NOT be in priors: templates are evaluated at unit fluence.
     Recover fluences with `draw_fluences_halfnormal_nooverlap_gaussmarg` from the 'snr_opt' and
@@ -766,10 +763,30 @@ def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
 
     # Restrict to the retained bins (DC and Nyquist discarded; see module docstring)
     sigma = jnp.broadcast_to(jnp.asarray(sigma_noise_fd, dtype=jnp.float32), data_fd.shape)
-    rho, gram = matched_filter_and_gram(templates, data_fd, 1.0 / sigma ** 2)
+    inv_noise_var = 1.0 / sigma ** 2
+    rho, gram = matched_filter_and_gram(templates, data_fd, inv_noise_var)
 
     # Analytic marginalization over the fluences; only the diagonal of the Gram matrix enters
     log_like, R, snr_opt, snr_mf = halfnormal_nooverlap_gaussmarg_log_likelihood(rho, gram, s_opt)
+
+    # Wraparound penalty, only if requested; otherwise the exact ratio is computed post-hoc
+    if containment_FD is not None:
+        # The fluences are integrated out, so the wraparound ratio, which depends on their
+        # relative sizes, has no per-draw amplitude to use. We plug in the conditional mean
+        # E[A | theta, d], which here is closed-form and nearly free: under the half-normal prior
+        # and non-overlap, each A_j is an independent normal truncated to A > 0, with location
+        # z_j sigma_A,j, so its mean is sigma_A,j [z_j + phi(z_j) / Phi(z_j)]. The ratio
+        # phi / Phi is evaluated in log space so it stays finite for negative z.
+        # Exact for a single pulse, where the amplitude cancels from the ratio. For several
+        # pulses it is a plug-in approximation, and because the conditional mean depends on the
+        # data, the penalty is then a data-dependent soft constraint rather than a strict prior.
+        # The exact ratio is computed after sampling from the drawn fluences.
+        s = jnp.broadcast_to(jnp.asarray(s_opt, dtype=snr_mf.dtype), (n_pulses,))
+        z = s * snr_mf / jnp.sqrt(1.0 + s ** 2)
+        sigma_A = (s / jnp.sqrt(1.0 + s ** 2)) / snr_opt
+        A_approx = sigma_A * (z + jnp.exp(norm.logpdf(z) - norm.logcdf(z)))
+        wraparound_ratio(params_stacked, single_pulse_fn, A_approx, inv_noise_var,
+                         containment_FD, site_name="wraparound_ratio_realtime_approx")
 
     # Stored per sample so fluences can be drawn afterwards without re-evaluating templates.
     # z_j is deliberately not stored: it is a fixed function of 'snr_mf' and the chosen s_opt,
