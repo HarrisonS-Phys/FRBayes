@@ -230,7 +230,8 @@ def setup_model(
     times: jnp.ndarray,
     sed_fn: Callable = running_power_law_sed,
     pulse_fn: Callable = scattered_gaussian_fd_pulse,
-    fourier_freqs=None
+    fourier_freqs=None,
+    _wraparoundFDdiagnostic: bool = True,
 ):
     """
     Setting up the necessary constants for the model itself. The model will be written as a closure within the setup method.
@@ -238,6 +239,9 @@ def setup_model(
     constants_dict: dict of each constant in the model
     freqs_channels: array of frequency channels in the data
     times: array of time bins in the data
+    _wraparoundFDdiagnostic: if True, also builds the same model on the two frequencies
+        [f1/2, f1], f1 = 1 / W_seg, and attaches it as `.low`. The likelihoods use it to
+        record the wraparound ratio. The inner call sets this False, so it does not recurse.
     """
     ### We are setting up constant values here
     constants = ModelConstants(**constants_dict)
@@ -269,5 +273,14 @@ def setup_model(
     single_pulse_model.grid = grid
     single_pulse_model.sed_fn = sed_fn.__name__
     single_pulse_model.pulse_fn = pulse_fn.__name__
+
+    if _wraparoundFDdiagnostic:
+        t = jnp.asarray(times, dtype=jnp.float32).reshape(-1)
+        W_seg = t.shape[0] * float(t[1] - t[0])
+        single_pulse_model.lowfreq_diagnostic = setup_model(
+            constants_dict, freqs_channels, times, sed_fn, pulse_fn,
+            fourier_freqs=jnp.array([0.5 / W_seg, 1.0 / W_seg], dtype=jnp.float32),
+            _wraparoundFDdiagnostic=False,
+        )
 
     return single_pulse_model

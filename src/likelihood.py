@@ -194,65 +194,39 @@ def sample_contained_widths(
 
     return sigma, tau_ref
 
-def sample_contained_lowestFDbin(
-    params_stacked: Dict[str, jnp.ndarray],
-    single_pulse_fn_low: Callable,
-    inv_noise_var: jnp.ndarray,
-    ratio_min: float = 0.9,
-    K: float = 100.0,
-    w: float = 0.01,
-) -> jnp.ndarray:
+def wraparound_penalty(ratio, ratio_min=0.9, K=100.0, w=0.01):
+    """Soft penalty: ~0 for ratio > ratio_min, rising to K nats at ratio = 0, sharpness w."""
+    return -(K / jax.nn.softplus(ratio_min / w)) * jax.nn.softplus((ratio_min - ratio) / w)
+
+def _wraparound_ratio_value(params_stacked, single_pulse_fn, amplitudes, inv_noise_var):
     """
-    Penalizes the model having power below the segment's fundamental frequency, which is the
-    power that wraps around in a periodic Fourier-domain model.
+    Pure computation, no numpyro sites: R = sqrt(P(f1) / P(f1/2)) of the full summed model,
+    P the noise-weighted power, f1 = 1 / W_seg. Used both inside the models and post-hoc.
 
-    The statistic is the noise-weighted power of the summed model at the lowest resolvable
-    frequency f1 = 1 / W_seg, relative to its power at f1 / 2:
-
-        ratio = sqrt( sum_a |M_a(f1)|^2 / sigma_a^2  /  sum_a |M_a(f1/2)|^2 / sigma_a^2 )
-
-    A pulse comfortably shorter than the segment has an envelope that is nearly flat between
-    f1/2 and f1, giving a ratio near 1; a pulse whose structure approaches the segment length has
-    begun to roll off there, and the ratio falls.
-
-    Two properties make this preferable to bounding sigma and tau separately. It is agnostic to
-    which parameter put power at long timescales, so it catches any configuration that wraps
-    rather than only the ones a width-plus-scattering rule anticipates. And because it is applied
-    to the full model rather than the temporal shape alone, the sum over channels is weighted by
-    the SED: a channel whose scattering tail is long but which carries no flux cannot dominate,
-    since what wraps is flux rather than timescale.
-
-        ln p = -K / softplus(ratio_min / w) * softplus((ratio_min - ratio) / w)
-
-    Flat above `ratio_min` and falling below it, with K the penalty at ratio = 0. The useful
-    range of the statistic is narrow -- 0.95 admits about 2e-4 of the flux beyond half a segment,
-    0.75 admits 7% -- so thresholds between roughly 0.85 and 0.95 are the meaningful ones, and w
-    of order 0.01 rather than the much sharper value used for the overlap prior.
-
-    Being a penalty rather than a bound, a burst too scattered for the segment is not forbidden
-    but pushed against the threshold: the recorded 'wraparound_ratio' piling up at `ratio_min` is
-    the signal to re-extract with a longer segment, in place of a parameter railing.
-
-    params_stacked:      the sampled pulse parameters, as returned by sample_pulse_parameters
-    single_pulse_fn_low: a model closure built on the two-frequency grid [f1/2, f1]
-    inv_noise_var:             1 / sigma_noise_fd^2, shape (nfreq, 1)
-
-    Returns the ratio, also recorded as the 'wraparound_ratio' site.
+    amplitudes: (n_pulses,) multipliers on top of the templates (ones if the templates
+                already carry the fluence). Only their ratios matter.
     """
-    models = jax.vmap(single_pulse_fn_low)(params_stacked)
-    model = jnp.sum(models, axis=0)  # (nfreq, 2), columns [f1/2, f1]
+    lowfreq_diagnostic = getattr(single_pulse_fn, "lowfreq_diagnostic", None)
+    if lowfreq_diagnostic is None:
+        raise ValueError("single_pulse_fn has no .lowfreq_diagnostic closure; build it with "
+                         "setup_model(..., _wraparoundFDdiagnostic=True).")
 
-    power_ref = jnp.sum(jnp.abs(model[:, 0]) ** 2 * inv_noise_var[:, 0])
-    power_low = jnp.sum(jnp.abs(model[:, 1]) ** 2 * inv_noise_var[:, 0])
-    ratio = jnp.sqrt(power_low / jnp.maximum(power_ref, _EPS))
+    models = jax.vmap(lowfreq_diagnostic)(params_stacked)                 # (P, nfreq, 2)
+    model = jnp.sum(amplitudes[:, None, None] * models, axis=0)           # (nfreq, 2)
+    power = jnp.sum(jnp.abs(model) ** 2 * jnp.asarray(inv_noise_var)[:, :1], axis=0)  # [P(f1/2), P(f1)]
+    return jnp.sqrt(power[1] / jnp.maximum(power[0], jnp.finfo(jnp.float32).tiny))
 
-    numpyro.deterministic("wraparound_ratio", ratio)
 
-    # Normalized so K is the penalty at ratio = 0, matching overlap_log_prior's convention
-    normalization = jax.nn.softplus(ratio_min / w)
-    numpyro.factor(
-        "wraparound_prior", -(K / normalization) * jax.nn.softplus((ratio_min - ratio) / w)
+def wraparound_ratio(params_stacked, single_pulse_fn, amplitudes, inv_noise_var,
+                     containment_FD=None, site_name="wraparound_ratio"):
+    """In-model version: records the ratio under `site_name`, and penalizes it if
+    containment_FD is given."""
+    ratio = numpyro.deterministic(
+        site_name,
+        _wraparound_ratio_value(params_stacked, single_pulse_fn, amplitudes, inv_noise_var),
     )
+    if containment_FD is not None:
+        numpyro.factor("wraparound_penalty", wraparound_penalty(ratio, **containment_FD))
     return ratio
 
 def sample_pulse_parameters(
@@ -327,10 +301,9 @@ def sample_pulse_parameters(
 
         methods = {
             "sample_contained_widths": sample_contained_widths,        # n_sigma widths + n_tau e-folds fit in the segment
-            "sample_contained_lowestFDbin": sample_contained_lowestFDbin,  # template envelope survives at f = 1 / segment
         }
         settings = dict(containment)
-        method = settings.pop("method", "lowest_fd_bin")
+        method = settings.pop("method", "sample_contained_widths")
         if method not in methods:
             raise ValueError(f"unknown containment method '{method}'; expected one of {sorted(methods)}.")
 
@@ -454,6 +427,20 @@ def fullnormal_gaussmarg_log_likelihood(
     Returns (log_likelihood, R, snr_opt, snr_mf).
     """
     snr_opt, snr_mf, R = _snr_and_overlaps(rho, gram)
+    if containment_FD is not None:
+        # The fluences are integrated out, so the wraparound ratio, which depends on their
+        # relative sizes, has no per-draw amplitude to use. We plug in the conditional mean
+        # E[A | theta, d], which here is closed-form and nearly free: the conditional is the
+        # Gaussian N([R + diag(s_opt^-2)]^-1 SNR_mf, ...) in SNR units, so its mean is one
+        # Cholesky solve on an n_pulses x n_pulses matrix, divided by SNR_opt to give fluence.
+        # Exact for a single pulse, where the amplitude cancels from the ratio. For several
+        # pulses it is a plug-in approximation, and because the conditional mean depends on the
+        # data, the penalty is then a data-dependent soft constraint rather than a strict prior.
+        # The exact ratio is computed after sampling from the drawn fluences.
+        chol, _ = _gaussian_fluence_prior_cholesky(R, s_opt)
+        A_approx = jax.scipy.linalg.cho_solve((chol, True), snr_mf) / snr_opt
+        wraparound_ratio(params_stacked, single_pulse_fn, A_approx, inv_noise_var,
+                         containment_FD, site_name="wraparound_ratio_realtime_approx")
     chol, s_opt_broadcast = _gaussian_fluence_prior_cholesky(R, s_opt)
 
     # Quadratic term via a triangular solve rather than an explicit inverse
@@ -489,6 +476,23 @@ def halfnormal_nooverlap_gaussmarg_log_likelihood(
     Returns (log_likelihood, R, snr_opt, snr_mf).
     """
     snr_opt, snr_mf, R = _snr_and_overlaps(rho, gram)
+    if containment_FD is not None:
+        # The fluences are integrated out, so the wraparound ratio, which depends on their
+        # relative sizes, has no per-draw amplitude to use. We plug in the conditional mean
+        # E[A | theta, d], which here is closed-form and nearly free: under the half-normal prior
+        # and non-overlap, each A_j is an independent normal truncated to A > 0, with location
+        # z_j sigma_A,j, so its mean is sigma_A,j [z_j + phi(z_j) / Phi(z_j)]. The ratio
+        # phi / Phi is evaluated in log space so it stays finite for negative z.
+        # Exact for a single pulse, where the amplitude cancels from the ratio. For several
+        # pulses it is a plug-in approximation, and because the conditional mean depends on the
+        # data, the penalty is then a data-dependent soft constraint rather than a strict prior.
+        # The exact ratio is computed after sampling from the drawn fluences.
+        s = jnp.broadcast_to(jnp.asarray(s_opt, dtype=snr_mf.dtype), (n_pulses,))
+        z = s * snr_mf / jnp.sqrt(1.0 + s ** 2)
+        sigma_A = (s / jnp.sqrt(1.0 + s ** 2)) / snr_opt
+        A_approx = sigma_A * (z + jnp.exp(norm.logpdf(z) - norm.logcdf(z)))
+        wraparound_ratio(params_stacked, single_pulse_fn, A_approx, inv_noise_var,
+                         containment_FD, site_name="wraparound_ratio_realtime_approx")
     s_opt_broadcast = jnp.broadcast_to(jnp.asarray(s_opt, dtype=jnp.float32), rho.shape)
 
     z = s_opt_broadcast * snr_mf / jnp.sqrt(1.0 + s_opt_broadcast ** 2)
@@ -603,6 +607,22 @@ def draw_fluences_halfnormal_nooverlap_gaussmarg(
     # Convert from SNR units to fluence
     return sigma_A * y
 
+def wraparound_ratio_posthoc(samples, fluences, single_pulse_fn, inv_noise_var,
+                             param_names=("mean_arrival_time", "sigma", "DM", "tau_ref", "c1", "c2")):
+    """
+    Exact wraparound ratio for every posterior draw, from fluences drawn after sampling
+    (draw_fluences_halfnormal_nooverlap_gaussmarg or draw_fluences_fullnormal_gaussmarg).
+
+    samples:     dict of posterior draws, each (n_draws, n_pulses), as from mcmc.get_samples()
+    fluences:    (n_draws, n_pulses)
+    param_names: the parameters single_pulse_fn reads; add 'delta' if it is sampled
+
+    Returns (n_draws,).
+    """
+    params = {k: samples[k] for k in param_names}
+    return jax.vmap(
+        lambda p, a: _wraparound_ratio_value(p, single_pulse_fn, a, inv_noise_var)
+    )(params, fluences)
 
 # -------------------------------------------------------------------
 # 4. NumPyro models
@@ -625,7 +645,7 @@ def FD_marg_fullnormal_gaussianlikelihood(
     overlap_R0: float = 0.9,
     overlap_w: float = 0.002,
     time_param: str = "mean_arrival_time",
-    containment: dict = None, #support for contained pulse priors within data segment, remove with pass-through below if deleting
+    containment_FD: dict = None, #support for contained pulse priors within data segment, remove with pass-through below if deleting
     spectral_coeff_map: dict = None,   # ORTHOGONAL SED SUPPORT: remove with the pass-through below if deleting orthog support
 ):
     """
@@ -637,7 +657,7 @@ def FD_marg_fullnormal_gaussianlikelihood(
     spectral_coeff_map: if the orthogonal spectral basis is in use, the conversion coefficients
                         from `orthogonal_spectral_basis`; gamma and beta are then recorded as
                         deterministic sites alongside the sampled c1 and c2.
-    containment:    if given, sigma and tau_ref are drawn jointly so the pulse fits inside the
+    containment_FD:    if given, sigma and tau_ref are drawn jointly so the pulse fits inside the
                     segment (see `sample_contained_widths`) rather than from independent priors;
                     'sigma' and 'tau_ref' must then be absent from `priors`.
 
@@ -691,6 +711,7 @@ def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
     overlap_w: float = 0.002,
     time_param: str = "mean_arrival_time",
     containment: dict = None, #support for contained pulse priors within data segment, remove with pass-through below if deleting
+    containment_FD: dict = None,
     spectral_coeff_map: dict = None,   # ORTHOGONAL SED SUPPORT: remove with the pass-through below if deleting orthog support
 ):
     """
@@ -816,34 +837,32 @@ def FD_gaussianlikelihood(
 
     _validate_fourier_inputs(data_fd, sigma_noise_fd)
 
-    #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param, spectral_coeff_map)
     params_stacked = sample_pulse_parameters(
         n_pulses, priors, time_param,
         spectral_coeff_map=spectral_coeff_map, containment=containment,
     )
-    if containment_FD is not None:
-        sample_contained_lowestFDbin(params_stacked, **containment_FD)
     templates = pulse_templates(params_stacked, single_pulse_fn)
 
     inv_noise_var = 1.0 / jnp.broadcast_to(jnp.asarray(sigma_noise_fd, dtype=jnp.float32), data_fd.shape) ** 2
 
     if amplitude_in_snr:
-        # Templates carry unit fluence, since 'A' is absent from the parameter dict, so the
-        # diagonal of the Gram matrix gives SNR_opt. Only the diagonal is needed: O(P N), not O(P^2 N).
+        # Templates carry unit fluence, so their power gives SNR_opt
         snr_opt = jnp.sqrt(jnp.maximum(jnp.sum(jnp.abs(templates) ** 2 * inv_noise_var[None], axis=(1, 2)), _EPS))
         numpyro.deterministic("snr_opt", snr_opt)
 
-        # Fluence is the physical quantity to report; A_snr is specific to this template
         A = numpyro.deterministic("A", params_stacked["A_snr"] / snr_opt)
         model_fd = jnp.sum(A[:, None, None] * templates, axis=0)
+        wraparound_amplitudes = A
     else:
-        # 'A' was in the parameter dict, so the templates already carry the fluence and 'A' is
-        # already a sample site; registering it again as a deterministic would be a name clash
+        # Templates (and the low-frequency diagnostic) already carry the fluence
         model_fd = jnp.sum(templates, axis=0)
+        wraparound_amplitudes = jnp.ones(n_pulses)
+
+    # Recorded every run; penalized only if containment_FD is given
+    wraparound_ratio(params_stacked, single_pulse_fn, wraparound_amplitudes,
+                     inv_noise_var, containment_FD)
 
     residual = data_fd - model_fd
-
-    # Real and imaginary parts are independent with variance sigma^2
     numpyro.factor("log_likelihood", -0.5 * jnp.sum(jnp.abs(residual) ** 2 * inv_noise_var))
 
 def TD_gaussianlikelihood(
