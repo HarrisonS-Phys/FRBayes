@@ -16,6 +16,13 @@ import xarray as xr
 from arviz_base import from_dict
 
 
+def _fn_name(fn):
+    """Name of a function for the run record; netcdf attributes cannot hold the function itself."""
+    if fn is None:
+        return ""
+    return getattr(fn, "__name__", type(fn).__name__)
+
+
 def describe_priors(priors):
     """
     Serializable description of the priors, one string per parameter.
@@ -52,7 +59,8 @@ def describe_data(path, event_id=None, n_bytes=None):
         "data.bytes_hashed": str(n_bytes) if n_bytes else "all",
     }
 
-def save_run(path, mcmc, burst, priors, data_path,
+
+def save_run(path, mcmc, burst, priors, data_path, single_pulse_fn=None,
              event_id=None, hash_bytes=None, extra_samples=None, **extra):
     """
     Writes a fit to netcdf: posterior samples, plus the conditioning needed to interpret them.
@@ -60,12 +68,17 @@ def save_run(path, mcmc, burst, priors, data_path,
     mcmc:            the finished MCMC object; samples are taken with group_by_chain=True, so the
                      leading two axes are (chain, draw) with no shape guessing
     burst:           the ConditionedData the fit used
-    priors:          the priors dictionary passed to the likelihood
+    priors:          the priors dictionary of the fit, as returned by run.set_priors. For a
+                     marginalized fit this still contains 'A_snr', so the amplitude prior that was
+                     integrated over is recorded too.
     data_path:       the file that was analyzed; its contents are hashed, not stored
+    single_pulse_fn: the model closure the fit used; only the names of its SED and pulse
+                     functions are recorded
     extra_samples:   further posterior arrays to store beside the sampled sites, e.g. fluences
-                     drawn after a marginalized fit. Each must already be shaped
-                     (n_chains, n_draws, ...) to match mcmc's own samples
-    extra:           any further scalars worth recording (s_opt, n_pulses, ...), stored as strings
+                     drawn after a marginalized fit (run.posthoc_samples returns these). Each must
+                     already be shaped (n_chains, n_draws, ...) to match mcmc's own samples, and
+                     must not share a name with a sampled site
+    extra:           any further scalars worth recording (n_pulses, ...), stored as strings
 
     The reference frequency is recorded because gamma and tau_ref are defined relative to it and
     it differs per burst; the spectral basis because c1 and c2 are meaningless without it.
@@ -74,6 +87,10 @@ def save_run(path, mcmc, burst, priors, data_path,
     n_chains, n_draws = next(iter(samples.values())).shape[:2]
 
     for name, value in (extra_samples or {}).items():
+        if name in samples:
+            raise ValueError(
+                f"extra_samples['{name}'] would overwrite the sampled site of the same name."
+            )
         value = np.asarray(value)
         if value.shape[:2] != (n_chains, n_draws):
             raise ValueError(
@@ -88,16 +105,19 @@ def save_run(path, mcmc, burst, priors, data_path,
     idata.posterior.attrs.update(describe_data(data_path, event_id, hash_bytes))
     idata.posterior.attrs.update({
         "likelihood": mcmc.sampler.model.__name__,
-        "sed_fn": getattr(single_pulse_fn, "sed_fn", ""),
-        "pulse_fn": getattr(single_pulse_fn, "pulse_fn", ""),
+        "sed_fn": _fn_name(getattr(single_pulse_fn, "sed_fn", None)),
+        "pulse_fn": _fn_name(getattr(single_pulse_fn, "pulse_fn", None)),
         "freq_channels_ref": f"{burst.freq_channels_ref:.6f}",
         "n_noise_bins": str(burst.n_noise_bins),
         **{k: str(v) for k, v in extra.items()},
     })
+
+    P1, P2 = burst.spectral_basis
+    freq = np.asarray(burst.freq_channels).reshape(-1)
     idata["conditioning"] = xr.Dataset(
         {
-            "P1": ("freq_channel", P1),
-            "P2": ("freq_channel", P2),
+            "P1": ("freq_channel", np.asarray(P1).reshape(-1)),
+            "P2": ("freq_channel", np.asarray(P2).reshape(-1)),
             "channel_weights": ("freq_channel", np.asarray(burst.channel_weights).reshape(-1)),
             "channel_width": ("freq_channel", np.asarray(burst.channel_width).reshape(-1)),
             "sigma_noise_fd": ("freq_channel", np.asarray(burst.sigma_noise_fd).reshape(-1)),
