@@ -231,6 +231,7 @@ def wraparound_ratio(params_stacked, single_pulse_fn, amplitudes, inv_noise_var,
 
 def sample_pulse_parameters(
     n_pulses: int,
+    shared_params: tuple,
     priors: Dict[str, dist.Distribution],
     time_param: str = "mean_arrival_time",
     containment: dict = None,          # WIDTH CONTAINMENT SUPPORT: remove with the block below
@@ -260,10 +261,23 @@ def sample_pulse_parameters(
             f"without ordering there are n_pulses! equivalent posterior modes."
         )
 
+    unknown = set(shared_params) - priors.keys()
+    if unknown:
+        raise ValueError(f"shared_params {sorted(unknown)} are not in priors.")
+    if time_param in shared_params:
+        raise ValueError("arrival times cannot be shared; they are what distinguish the pulses.")
+
     params_stacked = {}
     for param_name, distribution in priors.items():
         if param_name == time_param:
             params_stacked[param_name] = sample_ordered_arrival_times(param_name, distribution, n_pulses)
+        elif param_name in shared_params:
+            # One value for the whole burst, sampled once and repeated for every pulse. The
+            # repeated array is recorded under the usual name, so downstream code is unchanged.
+            value = numpyro.sample(f"{param_name}_shared", distribution)
+            params_stacked[param_name] = numpyro.deterministic(
+                param_name, jnp.broadcast_to(value, (n_pulses,))
+            )
         else:
             # Same prior for every pulse, sampled as one batched site
             params_stacked[param_name] = numpyro.sample(param_name, distribution.expand([n_pulses]))
@@ -607,6 +621,7 @@ def FD_marg_fullnormal_gaussianlikelihood(
     data_fd: jnp.ndarray,
     sigma_noise_fd: jnp.ndarray,
     n_pulses: int,
+    shared_params: tuple,
     priors: Dict[str, dist.Distribution],
     single_pulse_fn: Callable,
     s_opt: float,
@@ -648,7 +663,7 @@ def FD_marg_fullnormal_gaussianlikelihood(
     #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
     #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param, spectral_coeff_map)
     params_stacked = sample_pulse_parameters(
-        n_pulses, priors, time_param,
+        n_pulses, shared_params, priors, time_param,
         spectral_coeff_map=spectral_coeff_map, containment=containment,
     )
     templates = pulse_templates(params_stacked, single_pulse_fn)
@@ -694,6 +709,7 @@ def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
     data_fd: jnp.ndarray,
     sigma_noise_fd: jnp.ndarray,
     n_pulses: int,
+    shared_params: tuple,
     priors: Dict[str, dist.Distribution],
     single_pulse_fn: Callable,
     s_opt: float,
@@ -756,7 +772,7 @@ def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
     #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
     #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param, spectral_coeff_map)
     params_stacked = sample_pulse_parameters(
-        n_pulses, priors, time_param,
+        n_pulses, shared_params, priors, time_param,
         spectral_coeff_map=spectral_coeff_map, containment=containment,
     )
     templates = pulse_templates(params_stacked, single_pulse_fn)
@@ -812,6 +828,7 @@ def FD_gaussianlikelihood(
     data_fd: jnp.ndarray,
     sigma_noise_fd: jnp.ndarray,
     n_pulses: int,
+    shared_params: tuple,
     priors: Dict[str, dist.Distribution],
     single_pulse_fn: Callable,
     time_param: str = "mean_arrival_time",
@@ -855,7 +872,7 @@ def FD_gaussianlikelihood(
     _validate_fourier_inputs(data_fd, sigma_noise_fd)
 
     params_stacked = sample_pulse_parameters(
-        n_pulses, priors, time_param,
+        n_pulses, shared_params, priors, time_param,
         spectral_coeff_map=spectral_coeff_map, containment=containment,
     )
     templates = pulse_templates(params_stacked, single_pulse_fn)
@@ -886,6 +903,7 @@ def TD_gaussianlikelihood(
     data_td: jnp.ndarray,
     sigma_noise_td: jnp.ndarray,
     n_pulses: int,
+    shared_params: tuple,
     priors: Dict[str, dist.Distribution],
     single_pulse_fn: Callable,
     dt: float,
@@ -916,7 +934,7 @@ def TD_gaussianlikelihood(
     #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param)
     #params_stacked = sample_pulse_parameters(n_pulses, priors, time_param, spectral_coeff_map)
     params_stacked = sample_pulse_parameters(
-        n_pulses, priors, time_param,
+        n_pulses, shared_params, priors, time_param,
         spectral_coeff_map=spectral_coeff_map, containment=containment,
     )
     model_fd = jnp.sum(pulse_templates(params_stacked, single_pulse_fn), axis=0)

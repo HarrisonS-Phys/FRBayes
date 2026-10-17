@@ -246,6 +246,11 @@ def default_init(burst, priors: Dict[str, dist.Distribution], n_pulses: int = 1,
         for name, value in targets.items() if name in priors
     }
 
+    # Shared parameters are sampled once, as '<name>_shared'; start them at the same value
+    # (harmless when nothing is shared, since such sites then don't exist)
+    for name in list(values):
+        values[f"{name}_shared"] = values[name][0]
+
     # ---- arrival times ----
     if time_param in priors:
         time_prior = priors[time_param]
@@ -281,6 +286,7 @@ def run_fit(
     dense_mass: bool = True,
     chain_method: str = "parallel",
     progress_bar: bool = True,
+    shared_params: tuple = ("DM", "tau_ref"),
     extra_fields=("num_steps", "accept_prob", "diverging", "potential_energy"),
     **likelihood_kwargs,
 ) -> MCMC:
@@ -293,6 +299,8 @@ def run_fit(
                        passed in is not modified, so it can be saved as-is.
     init_strategy:     None uses default_init: a broad pulse in the middle of the segment, or for
                        several pulses that region shared out evenly among them
+    shared_params: parameters sampled once and used by every pulse (sampled as '<name>_shared',
+                   recorded per pulse under the usual name). () keeps every parameter per-pulse.
     likelihood_kwargs: passed straight to the likelihood, e.g. containment=, containment_FD=,
                        apply_overlap_prior=. Arguments run_fit fills in itself (the data, priors,
                        model, spectral_coeff_map and s_opt) cannot be given here.
@@ -300,6 +308,10 @@ def run_fit(
     Raises if the amplitude prior does not match the likelihood: an unmarginalized fit needs
     exactly one of 'A' and 'A_snr', and a marginalized fit needs 'A_snr' ~ HalfNormal and no 'A'.
     """
+    unknown = set(shared_params) - priors.keys()
+    if unknown:
+        raise ValueError(f"shared_params {sorted(unknown)} are not in priors.")
+
     filled_in = {"data_fd", "sigma_noise_fd", "n_pulses", "priors", "single_pulse_fn",
                  "spectral_coeff_map", "s_opt"}
     clash = filled_in & likelihood_kwargs.keys()
@@ -339,6 +351,7 @@ def run_fit(
         # Only meaningful when sampling the orthogonal basis; with gamma and beta it must be None
         spectral_coeff_map=burst.spectral_coeff_map if "c1" in model_priors else None,
         extra_fields=extra_fields,
+        shared_params=shared_params,
         **model_kwargs,
         **likelihood_kwargs,
     )
