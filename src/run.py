@@ -28,6 +28,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import numpyro.distributions as dist
+from numpyro.distributions.transforms import biject_to
 from numpyro.infer import MCMC, NUTS, init_to_value
 
 from likelihood import (
@@ -204,31 +205,65 @@ def _interior(distribution, value, margin=1e-3):
     return min(max(value, low + pad), high - pad)
 
 
-def default_init(burst, priors: Dict[str, dist.Distribution], n_pulses: int = 1):
+def default_init(burst, priors: Dict[str, dist.Distribution], n_pulses: int = 1,
+                 time_param: str = "mean_arrival_time"):
     """
     Starts the sampler from a broad pulse in the middle of the segment, with no residual
-    dispersion, a flat spectrum and little scattering.
+    dispersion, a flat spectrum and little scattering, split evenly among the pulses.
 
     Starting broad matters because the priors span the whole segment: a narrow starting pulse
     that misses the burst has no overlap with it, so the likelihood has no gradient pointing
     toward it. A pulse covering most of the segment overlaps the burst wherever it is, and
     warmup narrows it down.
 
-    Only parameters present in `priors` are set; the rest use NumPyro's default. With several
-    pulses the arrival times are sampled through an ordered base site, so they are left to the
-    default too.
+    One pulse: width sigma_1 = 0.9 * (upper bound of the sigma prior), centred on the middle
+    of the segment.
+
+    n pulses: the same region is shared out. Each pulse has width sigma_1 / n, and the centres
+    are evenly spaced about the middle of the segment, 2 sigma_1 / n apart:
+
+        t_j = W_seg / 2 + (2 sigma_1 / n) (j - (n - 1) / 2),    j = 0, ..., n - 1
+
+    so together they tile the central +-sigma_1 of the single-pulse start, and neighbouring
+    pulses are two of their own widths apart, which keeps their initial overlap modest. Every
+    other parameter starts at the same value for all pulses; the arrival times are what
+    distinguish them, and they are distinct and ordered, as the ordering prior requires.
+
+    Only parameters present in `priors` are set; the rest use NumPyro's default. Values are
+    moved just inside their prior bounds if they would fall outside them, e.g. a width
+    sigma_1 / n below the resolvability floor.
     """
     W_seg = burst.n_time * burst.dt
     targets = {"DM": 0.0, "c1": 0.0, "c2": 0.0, "gamma": 0.0, "beta": 0.0, "tau_ref": 5.0 * burst.dt}
+
+    sigma_single = None
     if getattr(priors.get("sigma"), "high", None) is not None:
-        targets["sigma"] = 0.9 * float(priors["sigma"].high)
-    if n_pulses == 1:
-        targets["mean_arrival_time"] = 0.5 * W_seg
+        sigma_single = 0.9 * float(priors["sigma"].high)
+        targets["sigma"] = sigma_single / n_pulses
 
     values = {
         name: jnp.full((n_pulses,), _interior(priors[name], value), dtype=jnp.float32)
         for name, value in targets.items() if name in priors
     }
+
+    # ---- arrival times ----
+    if time_param in priors:
+        time_prior = priors[time_param]
+        offsets = np.arange(n_pulses) - 0.5 * (n_pulses - 1)
+        spacing = 2.0 * sigma_single / n_pulses if sigma_single is not None else W_seg / (2.0 * n_pulses)
+        times = [_interior(time_prior, 0.5 * W_seg + spacing * k) for k in offsets]
+
+        if n_pulses == 1:
+            values[time_param] = jnp.asarray(times, dtype=jnp.float32)
+        else:
+            # With several pulses the sampled site is the unconstrained base vector z of
+            # sample_ordered_arrival_times, which sorts z and maps it into the prior's support.
+            # Setting z = (that map)^-1 (t) therefore starts the arrival times at exactly t.
+            to_support = biject_to(time_prior.support)
+            values[f"{time_param}_base"] = jnp.asarray(
+                to_support.inv(jnp.asarray(times, dtype=jnp.float32)), dtype=jnp.float32
+            )
+
     return init_to_value(values=values)
 
 
@@ -256,7 +291,8 @@ def run_fit(
     priors:            as returned by set_priors. For a marginalized likelihood, 'A_snr' is
                        removed before sampling and its scale passed as `s_opt`; the dictionary
                        passed in is not modified, so it can be saved as-is.
-    init_strategy:     None uses default_init, a broad pulse in the middle of the segment
+    init_strategy:     None uses default_init: a broad pulse in the middle of the segment, or for
+                       several pulses that region shared out evenly among them
     likelihood_kwargs: passed straight to the likelihood, e.g. containment=, containment_FD=,
                        apply_overlap_prior=. Arguments run_fit fills in itself (the data, priors,
                        model, spectral_coeff_map and s_opt) cannot be given here.
