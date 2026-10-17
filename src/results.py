@@ -110,6 +110,9 @@ def save_run(path, mcmc, burst, priors, data_path, single_pulse_fn=None,
         "freq_channels_ref": f"{burst.freq_channels_ref:.6f}",
         "n_noise_bins": str(burst.n_noise_bins),
         **{k: str(v) for k, v in extra.items()},
+        **{f"constant.{k}": str(v)
+           for k, v in vars(getattr(single_pulse_fn, "constants", None) or {}).items()
+           if np.ndim(v) == 0},
     })
 
     P1, P2 = burst.spectral_basis

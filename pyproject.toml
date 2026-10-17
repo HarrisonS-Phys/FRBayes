@@ -7,7 +7,7 @@ name = "FRBayes"
 version = "0.1.0"
 description = "Bayesian parameter estimation for Fast Radio Bursts using JAX and NumPyro"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.13,<3.14"
 dependencies = [
     "jax",
     "jaxlib",
@@ -18,6 +18,8 @@ dependencies = [
     "h5py>=3.16.0",
     "seaborn>=0.13.2",
     "arviz>=0.23.4",
+    "ipykernel>=7.3.0",
+    "h5netcdf>=1.8.1",
 ]
 
 [project.optional-dependencies]
@@ -29,3 +31,6 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.uv]
+python-preference = "only-system"
