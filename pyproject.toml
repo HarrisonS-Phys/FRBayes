@@ -28,6 +28,7 @@ dev = [
     "jupyter",
     "ruff",
 ]
+gpu = ["jax[cuda12]"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
