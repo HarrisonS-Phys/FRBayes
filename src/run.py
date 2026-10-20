@@ -248,8 +248,8 @@ def default_init(
     priors: Dict[str, dist.Distribution],
     n_pulses: int = 1,
     time_param: str = "mean_arrival_time",
-    ordered_times: bool = True,  # Strict time ordering prior on pulses
-    random_times: bool = True,   # each chain draws its own arrival times from the prior
+    ordered_times: bool = False,  # Strict time ordering prior on pulses
+    random_init_times: bool = True,   # each chain draws its own arrival times from the prior
 ):
     """
     Starts the sampler from broad pulses with no residual dispersion, a flat spectrum, little
@@ -267,11 +267,11 @@ def default_init(
     set_priors(..., n_pulses=n) that bound is already the single-pulse bound divided by n.
 
     Arrival times:
-      random_times=True (default): every chain draws its own times uniformly from the arrival-time
+      random_init_times=True (default): every chain draws its own times uniformly from the arrival-time
         prior (see init_to_value_random_times), so different chains start from different
         arrangements of pulses and together explore more of the possible solutions. Intended for
         running many chains and keeping the best.
-      random_times=False: the same times for every chain, evenly spaced about the middle of the
+      random_init_times=False: the same times for every chain, evenly spaced about the middle of the
         segment, 2 sigma apart:  t_j = W_seg / 2 + 2 sigma (j - (n - 1) / 2).
 
     Only parameters present in `priors` are set; the rest use NumPyro's default. Values are moved
@@ -297,7 +297,7 @@ def default_init(
         values[f"{name}_shared"] = values[name][0]
 
     # ---- arrival times ----
-    if time_param in priors and random_times:
+    if time_param in priors and random_init_times:
         return init_to_value_random_times(values=values, time_param=time_param,
                                           time_prior=priors[time_param])
 
@@ -338,7 +338,8 @@ def run_fit(
     shared_params: tuple = ("DM", "tau_ref"),
     extra_fields=("num_steps", "accept_prob", "diverging", "potential_energy"),
     target_accept_prob: float = 0.8,
-    ordered_times: bool = True, # Strict time ordering prior on pulses
+    ordered_times: bool = False, # Strict time ordering prior on pulses
+    random_init_times: bool = True, # Randomize intialized toas for sampler
     **likelihood_kwargs,
 ) -> MCMC:
     """

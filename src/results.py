@@ -155,3 +155,13 @@ def check_data_unchanged(run, data_path, n_bytes=None):
     if not stored:
         raise ValueError("this run has no stored data hash to compare against.")
     return stored == describe_data(data_path, n_bytes=n_bytes)["data.sha256"]
+
+def to_idata(mcmc, **kwargs):
+    """az.from_numpyro, working around ArviZ's assumption that max_tree_depth is a single number."""
+    depth = mcmc.sampler._max_tree_depth
+    if isinstance(depth, tuple):
+        mcmc.sampler._max_tree_depth = depth[1]      # the sampling-phase depth, which applied to the draws
+    try:
+        return az.from_numpyro(mcmc, **kwargs)
+    finally:
+        mcmc.sampler._max_tree_depth = depth

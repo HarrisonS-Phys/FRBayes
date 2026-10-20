@@ -633,7 +633,7 @@ def wraparound_ratio_posthoc(samples, fluences, single_pulse_fn, inv_noise_var,
 # evaluates those templates, and applies one of the likelihoods of Sections 2 and 3.
 # -------------------------------------------------------------------
 
-def repulsive_toa_prior(t, sigma, tau, snr, x_min=1.0, w=0.05, K=1000.0, snr_on=3.0, w_snr=0.25):
+def repulsive_toa_prior(t, sigma, tau, snr, x_min=1.0, w=0.05, K=1000.0, snr_on=3.0, w_snr=0.33):
     """
     Soft exclusion between pulses that are both active, so that no two can overlap to absorb
     misspecification together, while an idle pulse can still pass freely through an active one.
