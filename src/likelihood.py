@@ -633,21 +633,54 @@ def wraparound_ratio_posthoc(samples, fluences, single_pulse_fn, inv_noise_var,
 # evaluates those templates, and applies one of the likelihoods of Sections 2 and 3.
 # -------------------------------------------------------------------
 
-def repulsive_toa_prior(t, sigma, snr, x_min=1.0, w=0.05, K=1000.0, snr_on=3.0, w_snr=0.25):
+def repulsive_toa_prior(t, sigma, tau, snr, x_min=1.0, w=0.05, K=1000.0, snr_on=3.0, w_snr=0.25):
     """
     Soft exclusion between pulses that are both active, so that no two can overlap to absorb
     misspecification together, while an idle pulse can still pass freely through an active one.
 
+    WHAT IS SEPARATED: THE SCATTERED PROFILES, NOT JUST THE GAUSSIANS
+    Each pulse is a Gaussian (mean t, standard deviation sigma) convolved with the one-sided
+    exponential scattering kernel (1/tau) exp(-t'/tau), t' >= 0 -- the factor 1/(1 + 2 pi i f tau)
+    in scattered_gaussian_fd_pulse. That profile is the distribution of the sum of a Gaussian and
+    an independent exponential random variable (an exponentially modified Gaussian), so its mean
+    and variance are the sums of theirs:
+
+        centre_j = t_j + tau_j                    mean of pulse j's scattered profile
+        width_j  = sqrt(sigma_j^2 + tau_j^2)      its standard deviation
+
+    Measuring separation in sigma alone misses overlap through the tails: a narrow pulse and a
+    long-tailed one on the same burst can sit several sigma apart while overlapping almost
+    completely. This happens even with tau shared between pulses, because scattering scales as
+    nu^-4: a component emitting mainly at the bottom of the band has a much longer tail in the
+    data than one emitting at the top, although both have the same tau_ref. With tau shared the
+    centres shift equally, so x is the arrival-time difference over the scattered widths.
+
+    THE PRIOR
     For every pair j < k (no time ordering is assumed):
 
-        x_jk     = |t_j - t_k| / (sigma_j + sigma_k)                separation in units of width
-        wall_jk  = softplus((x_min - x_jk) / w) / softplus(x_min / w)    1 at full overlap, ~0 for x > x_min
-        on_j     = sigmoid((snr_j - snr_on) / w_snr)                 ~1 for an active pulse, ~0 for an idle one
+        x_jk     = |centre_j - centre_k| / (width_j + width_k)              separation in units of width
+        wall_jk  = softplus((x_min - x_jk) / w) / softplus(x_min / w)       1 at full overlap, ~0 for x > x_min
+        on_j     = sigmoid((snr_j - snr_on) / w_snr)                        ~1 for an active pulse, ~0 for an idle one
 
         log prior = -K * sum_{j<k} on_j on_k wall_jk
 
-    x_min:  minimum separation, in units of sigma_j + sigma_k. At x = 1 two equal Gaussians are
-            just resolved (their sum stops being single-peaked).
+    It depends only on the parameters, never on the data values, so it is a prior; it is applied
+    inside the likelihood functions only because the SNR of a pulse with a fluence prior has to be
+    computed from its template.
+
+    ARGUMENTS
+    t:      arrival times at the reference frequency (s), shape (n_pulses,)
+    sigma:  intrinsic Gaussian widths (s)
+    tau:    scattering times at the reference frequency, tau_ref (s), per pulse or shared. Tails
+            are longer below the reference frequency, so this is the lenient choice; tau at the
+            bottom of the band would be stricter. Zeros give separation by the Gaussians alone.
+    snr:    each pulse's optimal SNR at its current amplitude (A_snr, or computed from templates
+            that carry the fluence)
+    x_min:  minimum separation, in units of width_j + width_k. Without scattering, x = 1 is where
+            two equal Gaussians are just resolved (their sum stops being single-peaked). With
+            scattering it is the same criterion applied to the profiles' mean and spread, which
+            is approximate for strongly skewed profiles (tau >> sigma), whose peak sits well
+            before their mean.
     w:      softness of the wall, in units of x. With w = 0.05 the cost has fallen to ~1 nat by
             x = 1.2 (with K = 1000); a larger w leaks further past x_min.
     K:      depth of the wall at full overlap. It must exceed the log-likelihood an overlap could
@@ -657,13 +690,13 @@ def repulsive_toa_prior(t, sigma, snr, x_min=1.0, w=0.05, K=1000.0, snr_on=3.0, 
             costs ~K * 6e-6 ~ 0.006 nats, while an overlapping pulse is held below snr ~ 1.5,
             where it can absorb at most ~snr^2/2 ~ 1 nat.
 
-    snr: each pulse's optimal SNR at its current amplitude (A_snr, or computed from templates
-         that carry the fluence).
-
-    Returns (log prior, x) with x of shape (n_pulses * (n_pulses - 1) / 2,).
+    Returns (log prior, x) with x of shape (n_pulses * (n_pulses - 1) / 2,), in the pair order
+    of jnp.triu_indices(n_pulses, k=1): (0,1), (0,2), ..., (1,2), ...
     """
     j, k = jnp.triu_indices(t.shape[0], k=1)
-    x = jnp.abs(t[j] - t[k]) / (sigma[j] + sigma[k])
+    centre = t + tau                              # mean of each scattered profile
+    width = jnp.sqrt(sigma ** 2 + tau ** 2)       # its standard deviation
+    x = jnp.abs(centre[j] - centre[k]) / (width[j] + width[k])
     wall = jax.nn.softplus((x_min - x) / w) / jax.nn.softplus(x_min / w)
     on = jax.nn.sigmoid((snr - snr_on) / w_snr)
     return -K * jnp.sum(on[j] * on[k] * wall), x
@@ -961,7 +994,8 @@ def FD_gaussianlikelihood(
     # Only active pulses repel; see repulsive_toa_prior. 'toa_separation' is x for every pair.
     if repulsion is not None and n_pulses > 1:
         log_prior, separation = repulsive_toa_prior(
-            params_stacked[time_param], params_stacked["sigma"], pulse_snr, **repulsion
+            params_stacked[time_param], params_stacked["sigma"], params_stacked["tau_ref"],
+            pulse_snr, **repulsion
         )
         numpyro.deterministic("toa_separation", separation)
         numpyro.factor("repulsive_toa_prior", log_prior)

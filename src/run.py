@@ -297,6 +297,7 @@ def run_fit(
     seed: int = 0,
     init_strategy=None,
     dense_mass: bool = True,
+    max_tree_depth: int | tuple[int, int] = 10,    # or (warmup, sampling), e.g. (10, 8), # int, or (warmup, sampling) e.g. (10, 8)
     chain_method: str = "parallel",
     progress_bar: bool = True,
     shared_params: tuple = ("DM", "tau_ref"),
@@ -358,7 +359,8 @@ def run_fit(
     if init_strategy is None:
         init_strategy = default_init(burst, model_priors, n_pulses, ordered_times)
 
-    kernel = NUTS(likelihood, dense_mass=dense_mass, init_strategy=init_strategy, target_accept_prob=target_accept_prob)
+    kernel = NUTS(likelihood, dense_mass=dense_mass, init_strategy=init_strategy, 
+                  max_tree_depth=max_tree_depth, target_accept_prob=target_accept_prob)
     mcmc = MCMC(kernel, num_warmup=num_warmup, num_samples=num_samples, num_chains=num_chains,
                 chain_method=chain_method, progress_bar=progress_bar)
 
@@ -379,6 +381,10 @@ def run_fit(
     )
 
     mcmc.seed = seed                  # the seed actually used; save_run records it
+    mcmc.priors = dict(priors)                          # as passed in (a marginalized fit keeps A_snr here)
+    mcmc.n_pulses = n_pulses
+    mcmc.likelihood_kwargs = dict(likelihood_kwargs)    # e.g. repulsion, shared_params, ordered_times
+
     return mcmc
 
 
