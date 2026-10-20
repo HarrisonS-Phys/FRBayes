@@ -38,6 +38,7 @@ from likelihood import (
     draw_fluences_fullnormal_gaussmarg,
     draw_fluences_halfnormal_nooverlap_gaussmarg,
     wraparound_ratio_posthoc,
+    fluence_for_normalized_log_sed_models,
 )
 from priors import dispersion_prior_bounds, spectral_coeff_bounds, width_prior_bounds
 from results import describe_priors
@@ -59,6 +60,7 @@ PHYSICAL_SED_PARAMS = {"gamma", "beta"}     # spectral index and running
 def set_priors(
     burst,
     single_pulse_fn: Callable,
+    n_pulses: int,
     toa: float = None,
     s_opt: float = None,
     gamma_range=(-10.0, 200.0),
@@ -103,10 +105,16 @@ def set_priors(
     width = width_prior_bounds(burst, toa=toa)
     dm = dispersion_prior_bounds(burst, single_pulse_fn)
 
+    # Each of n pulses gets 1/n of the single-pulse upper bound on sigma
+    sigma_max = width["sigma_max"] / n_pulses
+    if sigma_max <= width["sigma_min"]:
+        raise ValueError(f"sigma upper bound / n_pulses = {sigma_max:.3g} s is below the lower bound "
+                         f"{width['sigma_min']:.3g} s: too many pulses for this segment.")
+
     priors = {
         "mean_arrival_time": dist.Uniform(0.0, float(burst.times[-1])),   # (s, relative to segment start)
         "DM": dist.Uniform(dm["DM_min"], dm["DM_max"]),                    # residual DM (pc cm^-3)
-        "sigma": dist.Uniform(width["sigma_min"], width["sigma_max"]),     # intrinsic width (s)
+        "sigma": dist.Uniform(width["sigma_min"], sigma_max),              # intrinsic width (s), per pulse
         "tau_ref": dist.Uniform(width["tau_ref_min"], width["tau_ref_max"]),  # scattering at nu_r (s)
     }
 
@@ -151,12 +159,12 @@ def set_priors(
     if physical and physical != PHYSICAL_SED_PARAMS:
         raise ValueError(f"only {sorted(physical)} set; gamma and beta must be given together.")
 
-    # Only checkable when the model exposes its SED function
-    sed_name = getattr(getattr(single_pulse_fn, "sed_fn", None), "__name__", None)
-    if sed_name == "running_power_law_sed" and orthogonal:
-        raise ValueError("the model uses running_power_law_sed, which reads gamma and beta, but "
+    # model.py stores the SED function's name itself, as a string
+    sed_name = getattr(single_pulse_fn, "sed_fn", None)
+    if sed_name == "running_power_law_log_sed" and orthogonal:
+        raise ValueError("the model uses running_power_law_log_sed, which reads gamma and beta, but "
                          "the priors set c1 and c2.")
-    if sed_name == "orthogonal_poly_sed" and physical:
+    if sed_name == "orthogonal_poly_log_sed" and physical:
         raise ValueError("the model uses the orthogonal SED basis, which reads c1 and c2, but "
                          "the priors set gamma and beta.")
 
@@ -205,8 +213,13 @@ def _interior(distribution, value, margin=1e-3):
     return min(max(value, low + pad), high - pad)
 
 
-def default_init(burst, priors: Dict[str, dist.Distribution], n_pulses: int = 1,
-                 time_param: str = "mean_arrival_time"):
+def default_init(
+    burst, 
+    priors: Dict[str, dist.Distribution], 
+    n_pulses: int = 1,
+    time_param: str = "mean_arrival_time",
+    ordered_times: bool = True, # Strict time ordering prior on pulses
+):
     """
     Starts the sampler from a broad pulse in the middle of the segment, with no residual
     dispersion, a flat spectrum and little scattering, split evenly among the pulses.
@@ -236,10 +249,10 @@ def default_init(burst, priors: Dict[str, dist.Distribution], n_pulses: int = 1,
     W_seg = burst.n_time * burst.dt
     targets = {"DM": 0.0, "c1": 0.0, "c2": 0.0, "gamma": 0.0, "beta": 0.0, "tau_ref": 5.0 * burst.dt}
 
-    sigma_single = None
+    sigma_init = None
     if getattr(priors.get("sigma"), "high", None) is not None:
-        sigma_single = 0.9 * float(priors["sigma"].high)
-        targets["sigma"] = sigma_single / n_pulses
+        sigma_init = 0.9 * float(priors["sigma"].high)
+        targets["sigma"] = sigma_init
 
     values = {
         name: jnp.full((n_pulses,), _interior(priors[name], value), dtype=jnp.float32)
@@ -255,10 +268,10 @@ def default_init(burst, priors: Dict[str, dist.Distribution], n_pulses: int = 1,
     if time_param in priors:
         time_prior = priors[time_param]
         offsets = np.arange(n_pulses) - 0.5 * (n_pulses - 1)
-        spacing = 2.0 * sigma_single / n_pulses if sigma_single is not None else W_seg / (2.0 * n_pulses)
+        spacing = 2.0 * sigma_init if sigma_init is not None else W_seg / (2.0 * n_pulses)
         times = [_interior(time_prior, 0.5 * W_seg + spacing * k) for k in offsets]
 
-        if n_pulses == 1:
+        if n_pulses == 1 or not ordered_times:
             values[time_param] = jnp.asarray(times, dtype=jnp.float32)
         else:
             # With several pulses the sampled site is the unconstrained base vector z of
@@ -288,6 +301,8 @@ def run_fit(
     progress_bar: bool = True,
     shared_params: tuple = ("DM", "tau_ref"),
     extra_fields=("num_steps", "accept_prob", "diverging", "potential_energy"),
+    target_accept_prob: float = 0.8,
+    ordered_times: bool = True, # Strict time ordering prior on pulses
     **likelihood_kwargs,
 ) -> MCMC:
     """
@@ -334,10 +349,16 @@ def run_fit(
         supported = [f.__name__ for f in MARGINALIZED + UNMARGINALIZED]
         raise ValueError(f"run_fit supports {supported}; got {getattr(likelihood, '__name__', likelihood)}.")
 
-    if init_strategy is None:
-        init_strategy = default_init(burst, model_priors, n_pulses)
+    if seed is None:
+        # JAX has no global random state: every run needs a key made from some integer. Draw one
+        # at random, and keep it so the run can be reproduced exactly.
+        seed = int(np.random.default_rng().integers(2**31 - 1))
+    print(f"run_fit seed: {seed}")
 
-    kernel = NUTS(likelihood, dense_mass=dense_mass, init_strategy=init_strategy)
+    if init_strategy is None:
+        init_strategy = default_init(burst, model_priors, n_pulses, ordered_times)
+
+    kernel = NUTS(likelihood, dense_mass=dense_mass, init_strategy=init_strategy, target_accept_prob=target_accept_prob)
     mcmc = MCMC(kernel, num_warmup=num_warmup, num_samples=num_samples, num_chains=num_chains,
                 chain_method=chain_method, progress_bar=progress_bar)
 
@@ -352,9 +373,12 @@ def run_fit(
         spectral_coeff_map=burst.spectral_coeff_map if "c1" in model_priors else None,
         extra_fields=extra_fields,
         shared_params=shared_params,
+        ordered_times=ordered_times,
         **model_kwargs,
         **likelihood_kwargs,
     )
+
+    mcmc.seed = seed                  # the seed actually used; save_run records it
     return mcmc
 
 
@@ -367,7 +391,7 @@ def posthoc_samples(
     burst,
     single_pulse_fn: Callable,
     priors: Dict[str, dist.Distribution],
-    seed: int = 1,
+    seed: int = None,
 ) -> Dict[str, np.ndarray]:
     """
     Posterior quantities that cannot be recorded during sampling, shaped (n_chains, n_draws, ...)
@@ -405,9 +429,9 @@ def posthoc_samples(
 
     accept = None
     if likelihood is FD_marg_halfnormal_nooverlap_gaussianlikelihood:
-        fluences = draw_fluences_halfnormal_nooverlap_gaussmarg(flat["snr_opt"], flat["snr_mf"], s_opt, key)
+        peak_channel_fluences = draw_fluences_halfnormal_nooverlap_gaussmarg(flat["snr_opt"], flat["snr_mf"], s_opt, key)
     else:
-        fluences, accept = draw_fluences_fullnormal_gaussmarg(flat["gram"], flat["rho_mf"], s_opt, key)
+        peak_channel_fluences, accept = draw_fluences_fullnormal_gaussmarg(flat["gram"], flat["rho_mf"], s_opt, key)
 
     # Every per-pulse site is passed to the model, which reads only the parameters it needs.
     # Amplitude sites are excluded, since the model would apply them on top of `fluences`.
@@ -416,9 +440,10 @@ def posthoc_samples(
         if v.shape == (n_chains * n_draws, n_pulses) and k not in AMPLITUDE_PARAMS
     )
     ratio = wraparound_ratio_posthoc(
-        flat, fluences, single_pulse_fn, 1.0 / burst.sigma_noise_fd ** 2, param_names=per_pulse
+        flat, peak_channel_fluences, single_pulse_fn, 1.0 / burst.sigma_noise_fd ** 2, param_names=per_pulse
     )
 
+    fluences = fluence_for_normalized_log_sed_models(peak_channel_fluences, flat["log_sed_peak"])
     extra = {"A": fluences, "wraparound_ratio": ratio}
     if accept is not None:
         extra["A_accept"] = accept.astype(jnp.int8)

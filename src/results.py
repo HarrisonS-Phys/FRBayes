@@ -105,6 +105,7 @@ def save_run(path, mcmc, burst, priors, data_path, single_pulse_fn=None,
     idata.posterior.attrs.update(describe_data(data_path, event_id, hash_bytes))
     idata.posterior.attrs.update({
         "likelihood": mcmc.sampler.model.__name__,
+        "seed": str(getattr(mcmc, "seed", "")),       # set by run.run_fit, so the run can be reproduced
         "sed_fn": _fn_name(getattr(single_pulse_fn, "sed_fn", None)),
         "pulse_fn": _fn_name(getattr(single_pulse_fn, "pulse_fn", None)),
         "freq_channels_ref": f"{burst.freq_channels_ref:.6f}",

@@ -236,6 +236,7 @@ def sample_pulse_parameters(
     time_param: str = "mean_arrival_time",
     containment: dict = None,          # WIDTH CONTAINMENT SUPPORT: remove with the block below
     spectral_coeff_map: dict = None,   # ORTHOGONAL SED SUPPORT: remove with the block below
+    ordered_times: bool = True, # Strict time ordering prior on pulses
 ) -> Dict[str, jnp.ndarray]:
     """
     Samples every pulse parameter from the prior dictionary into stacked arrays of shape
@@ -255,7 +256,7 @@ def sample_pulse_parameters(
     delimited block below, and the argument and its pass-through in each likelihood in Section 4.
     The same applies to `containment`. Nothing else depends on either.
     """
-    if n_pulses > 1 and time_param not in priors:
+    if ordered_times and n_pulses > 1 and time_param not in priors:
         raise ValueError(
             f"'{time_param}' must be in priors to time-order the pulses; "
             f"without ordering there are n_pulses! equivalent posterior modes."
@@ -269,7 +270,7 @@ def sample_pulse_parameters(
 
     params_stacked = {}
     for param_name, distribution in priors.items():
-        if param_name == time_param:
+        if param_name == time_param and ordered_times:
             params_stacked[param_name] = sample_ordered_arrival_times(param_name, distribution, n_pulses)
         elif param_name in shared_params:
             # One value for the whole burst, sampled once and repeated for every pulse. The
@@ -359,6 +360,21 @@ def pulse_templates(
     """Evaluates all pulse templates in parallel; shape (n_pulses, nfreq, nfourier)."""
     return jax.vmap(single_pulse_fn)(params_stacked)
 
+def log_sed_peaks(params_stacked, single_pulse_fn) -> jnp.ndarray:
+    """
+    ln max_a F_a for each pulse, shape (n_pulses,): the log of the factor model.py divides each
+    template by when no 'A' is given, so that the template cannot overflow. An amplitude B on
+    those templates is the fluence B exp(-log_sed_peak); see fluence_for_normalized_log_sed_models.
+    """
+    return jax.vmap(single_pulse_fn.log_sed_peak)(params_stacked)
+
+def fluence_for_normalized_log_sed_models(amplitude, log_sed_peak):
+    """
+    Fluence from an amplitude on the peak-normalized templates: amplitude * exp(-log_sed_peak),
+    computed in log space so that neither factor overflows on its own. The sign is carried
+    separately so negative draws (full-normal marginalization, before rejection) convert too.
+    """
+    return jnp.sign(amplitude) * jnp.exp(jnp.log(jnp.abs(amplitude)) - log_sed_peak)
 
 def matched_filter_and_gram(
     templates: jnp.ndarray,
@@ -617,6 +633,41 @@ def wraparound_ratio_posthoc(samples, fluences, single_pulse_fn, inv_noise_var,
 # evaluates those templates, and applies one of the likelihoods of Sections 2 and 3.
 # -------------------------------------------------------------------
 
+def repulsive_toa_prior(t, sigma, snr, x_min=1.0, w=0.05, K=1000.0, snr_on=3.0, w_snr=0.25):
+    """
+    Soft exclusion between pulses that are both active, so that no two can overlap to absorb
+    misspecification together, while an idle pulse can still pass freely through an active one.
+
+    For every pair j < k (no time ordering is assumed):
+
+        x_jk     = |t_j - t_k| / (sigma_j + sigma_k)                separation in units of width
+        wall_jk  = softplus((x_min - x_jk) / w) / softplus(x_min / w)    1 at full overlap, ~0 for x > x_min
+        on_j     = sigmoid((snr_j - snr_on) / w_snr)                 ~1 for an active pulse, ~0 for an idle one
+
+        log prior = -K * sum_{j<k} on_j on_k wall_jk
+
+    x_min:  minimum separation, in units of sigma_j + sigma_k. At x = 1 two equal Gaussians are
+            just resolved (their sum stops being single-peaked).
+    w:      softness of the wall, in units of x. With w = 0.05 the cost has fallen to ~1 nat by
+            x = 1.2 (with K = 1000); a larger w leaks further past x_min.
+    K:      depth of the wall at full overlap. It must exceed the log-likelihood an overlap could
+            buy, or the data win: for the test burst, splitting the 5.5 ms component bought ~300.
+    snr_on, w_snr: where a pulse counts as active, and how sharply. With the defaults an idle
+            pulse (snr ~ 0) has on = sigmoid(-12) ~ 6e-6, so passing through an active pulse
+            costs ~K * 6e-6 ~ 0.006 nats, while an overlapping pulse is held below snr ~ 1.5,
+            where it can absorb at most ~snr^2/2 ~ 1 nat.
+
+    snr: each pulse's optimal SNR at its current amplitude (A_snr, or computed from templates
+         that carry the fluence).
+
+    Returns (log prior, x) with x of shape (n_pulses * (n_pulses - 1) / 2,).
+    """
+    j, k = jnp.triu_indices(t.shape[0], k=1)
+    x = jnp.abs(t[j] - t[k]) / (sigma[j] + sigma[k])
+    wall = jax.nn.softplus((x_min - x) / w) / jax.nn.softplus(x_min / w)
+    on = jax.nn.sigmoid((snr - snr_on) / w_snr)
+    return -K * jnp.sum(on[j] * on[k] * wall), x
+
 def FD_marg_fullnormal_gaussianlikelihood(
     data_fd: jnp.ndarray,
     sigma_noise_fd: jnp.ndarray,
@@ -632,6 +683,7 @@ def FD_marg_fullnormal_gaussianlikelihood(
     containment: dict = None, #support for contained pulse priors within data segment, remove with pass-through below if deleting
     containment_FD: dict = None,
     spectral_coeff_map: dict = None,   # ORTHOGONAL SED SUPPORT: remove with the pass-through below if deleting orthog support
+    ordered_times: bool = True, # Strict time ordering prior on pulses
 ):
     """
     Fourier-domain Gaussian likelihood with the pulse fluences marginalized analytically using a zero-mean Gaussian prior.
@@ -665,6 +717,7 @@ def FD_marg_fullnormal_gaussianlikelihood(
     params_stacked = sample_pulse_parameters(
         n_pulses, shared_params, priors, time_param,
         spectral_coeff_map=spectral_coeff_map, containment=containment,
+        ordered_times=ordered_times, 
     )
     templates = pulse_templates(params_stacked, single_pulse_fn)
 
@@ -697,6 +750,7 @@ def FD_marg_fullnormal_gaussianlikelihood(
     numpyro.deterministic("rho_mf", rho)
     numpyro.deterministic("snr_opt", snr_opt)
     numpyro.deterministic("snr_mf", snr_mf)
+    numpyro.deterministic("log_sed_peak", log_sed_peaks(params_stacked, single_pulse_fn))
 
     if n_pulses > 1:
         # Overlaps recorded for diagnostics, and penalized near total overlap
@@ -721,6 +775,7 @@ def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
     containment: dict = None, #support for contained pulse priors within data segment, remove with pass-through below if deleting
     containment_FD: dict = None,
     spectral_coeff_map: dict = None,   # ORTHOGONAL SED SUPPORT: remove with the pass-through below if deleting orthog support
+    ordered_times: bool = True, # Strict time ordering prior on pulses
 ):
     """
     Fourier-domain Gaussian likelihood with the pulse fluences marginalized analytically using a
@@ -774,6 +829,7 @@ def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
     params_stacked = sample_pulse_parameters(
         n_pulses, shared_params, priors, time_param,
         spectral_coeff_map=spectral_coeff_map, containment=containment,
+        ordered_times=ordered_times, 
     )
     templates = pulse_templates(params_stacked, single_pulse_fn)
 
@@ -812,6 +868,7 @@ def FD_marg_halfnormal_nooverlap_gaussianlikelihood(
     numpyro.deterministic("rho_mf", rho)
     numpyro.deterministic("snr_opt", snr_opt)
     numpyro.deterministic("snr_mf", snr_mf)
+    numpyro.deterministic("log_sed_peak", log_sed_peaks(params_stacked, single_pulse_fn))
 
     if n_pulses > 1:
         # Recorded regardless, as the check on the non-overlap assumption
@@ -835,6 +892,8 @@ def FD_gaussianlikelihood(
     containment: dict = None, #support for contained pulse priors within data segment, remove with pass-through below if deleting
     containment_FD: dict = None,
     spectral_coeff_map: dict = None,
+    ordered_times: bool = True, # Strict time ordering prior on pulses
+    repulsion: dict = None # TO REMOVE
 ):
     """
     Fourier-domain Gaussian likelihood with fluences sampled directly (not marginalized),
@@ -874,6 +933,7 @@ def FD_gaussianlikelihood(
     params_stacked = sample_pulse_parameters(
         n_pulses, shared_params, priors, time_param,
         spectral_coeff_map=spectral_coeff_map, containment=containment,
+        ordered_times=ordered_times, 
     )
     templates = pulse_templates(params_stacked, single_pulse_fn)
 
@@ -884,13 +944,29 @@ def FD_gaussianlikelihood(
         snr_opt = jnp.sqrt(jnp.maximum(jnp.sum(jnp.abs(templates) ** 2 * inv_noise_var[None], axis=(1, 2)), _EPS))
         numpyro.deterministic("snr_opt", snr_opt)
 
-        A = numpyro.deterministic("A", params_stacked["A_snr"] / snr_opt)
-        model_fd = jnp.sum(A[:, None, None] * templates, axis=0)
-        wraparound_amplitudes = A
+        A_peak_channel = params_stacked["A_snr"] / snr_opt                      # amplitude on the peak channel SED normalized templates
+        model_fd = jnp.sum(A_peak_channel[:, None, None] * templates, axis=0)
+        wraparound_amplitudes = A_peak_channel
+        log_peak = numpyro.deterministic("log_sed_peak", log_sed_peaks(params_stacked, single_pulse_fn))
+        numpyro.deterministic("A", fluence_for_normalized_log_sed_models(A_peak_channel, log_peak))   # fluence
+        pulse_snr = params_stacked["A_snr"]               # each pulse's optimal SNR at its amplitude TO REMOVE
     else:
         # Templates (and the low-frequency diagnostic) already carry the fluence
         model_fd = jnp.sum(templates, axis=0)
         wraparound_amplitudes = jnp.ones(n_pulses)
+        pulse_snr = jnp.sqrt(jnp.sum(jnp.abs(templates) ** 2 * inv_noise_var[None], axis=(1, 2))) # TO REMOVE
+
+    # TO REMOVE BLOCK BELOW
+
+    # Only active pulses repel; see repulsive_toa_prior. 'toa_separation' is x for every pair.
+    if repulsion is not None and n_pulses > 1:
+        log_prior, separation = repulsive_toa_prior(
+            params_stacked[time_param], params_stacked["sigma"], pulse_snr, **repulsion
+        )
+        numpyro.deterministic("toa_separation", separation)
+        numpyro.factor("repulsive_toa_prior", log_prior)
+
+    # TO REMOVE BLOCK ABOVE
 
     # Recorded every run; penalized only if containment_FD is given
     wraparound_ratio(params_stacked, single_pulse_fn, wraparound_amplitudes,

@@ -1,13 +1,16 @@
 """
 NOTE ON PRECISION & GPU COMPATIBILITY:
-This module uses float32 for speed and broad GPU compatibility (where FP64 is often 
-slow or unsupported). Because float32 only retains ~7 decimal digits of precision, 
+This module uses float32 for speed and broad GPU compatibility (where FP64 is often
+slow or unsupported). Because float32 only retains ~7 decimal digits of precision,
 inputs must stay small to prevent rounding away tiny time delays:
 
-1. TIMING: Pass relative timestamps (times[0] ≈ 0). Large absolute times (MJD/Unix) 
+1. TIMING: Pass relative timestamps (times[0] ≈ 0). Large absolute times (MJD/Unix)
    round off fraction-of-a-second delays and distort phase.
-2. DM: Fit a residual DM around a dedispersed baseline. Large absolute DMs cause 
+2. DM: Fit a residual DM around a dedispersed baseline. Large absolute DMs cause
    multi-second delays that hit the same float32 precision limits.
+3. SED: The SED functions return ln F, not F. F = exp(ln F) overflows float32 once ln F > 88,
+   and the SNR, which squares F, once ln F > 44, both of which wide spectral priors reach.
+   single_pulse_model therefore only ever exponentiates normalized or combined logs.
 """
 
 from dataclasses import dataclass
@@ -53,7 +56,7 @@ def build_fd_grid(freqs_channels: jnp.ndarray, times: jnp.ndarray, constants: Mo
     """
     Constructs the Fourier domain evaluation grid.
 
-    Note: `times` MUST start near zero (|t_start| <= 1.0 s) so float32 
+    Note: `times` MUST start near zero (|t_start| <= 1.0 s) so float32
     does not round away small timing details.
     fourier_freqs: the Fourier bins the data occupies, from data.py. None rebuilds the full
                    rfft grid. The model evaluates templates at exactly these frequencies, so
@@ -118,19 +121,27 @@ def build_fd_grid(freqs_channels: jnp.ndarray, times: jnp.ndarray, constants: Mo
     )
 
 # -------------------------------------------------------------------
-# 2. Spectral Energy Distribution (SED) Functions (F)
+# 2. Spectral Energy Distribution (SED) Functions (ln F)
+#
+# Every SED function returns ln F, shape (nfreq, 1), NOT F. See note 3 in the module docstring:
+# single_pulse_model exponentiates it only after normalizing (or after adding ln A), so F itself
+# is never formed and cannot overflow.
 # -------------------------------------------------------------------
 
-def running_power_law_sed(params_dict: dict, grid: FDGrid, constants: ModelConstants) -> jnp.ndarray:
+def running_power_law_log_sed(params_dict: dict, grid: FDGrid, constants: ModelConstants) -> jnp.ndarray:
+    """
+    Log of the running power-law SED, F_a = (nu_a / nu_r)^kappa_a * det_response:
+
+        ln F_a = kappa_a x_a + ln(det_response),    kappa_a = gamma + beta x_a,    x_a = ln(nu_a / nu_r)
+    """
     gamma = jnp.float32(params_dict["gamma"])  # Spectral index for burst component
     beta = jnp.float32(params_dict["beta"])  # Spectral running for burst component
     det_response = jnp.float32(constants.det_response)
 
     kappa = gamma + (beta * grid.log_normalized_freqs_channels)  # Running power law of SED
-    F = (grid.normalized_freqs_channels ** kappa) * det_response
-    return F
+    return kappa * grid.log_normalized_freqs_channels + jnp.log(det_response)
 
-def make_orthogonal_poly_sed(P1: jnp.ndarray, P2: jnp.ndarray) -> Callable:
+def make_orthogonal_poly_log_sed(P1: jnp.ndarray, P2: jnp.ndarray) -> Callable:
     """
     Builds an SED function in an orthogonal polynomial basis:
 
@@ -146,18 +157,20 @@ def make_orthogonal_poly_sed(P1: jnp.ndarray, P2: jnp.ndarray) -> Callable:
     and beta afterwards with the coefficients returned alongside P1 and P2. Note that a fixed
     prior on (c1, c2) implies a different prior on (gamma, beta) than a fixed prior on those
     would, and that the coefficients are O(1) by construction, so their priors should be too.
+
+    The returned function gives ln F (plus ln det_response), not F.
     """
     P1 = jnp.asarray(P1, dtype=jnp.float32).reshape(-1, 1)
     P2 = jnp.asarray(P2, dtype=jnp.float32).reshape(-1, 1)
 
-    def orthogonal_poly_sed(params_dict: dict, grid: FDGrid, constants: ModelConstants) -> jnp.ndarray:
+    def orthogonal_poly_log_sed(params_dict: dict, grid: FDGrid, constants: ModelConstants) -> jnp.ndarray:
         c1 = jnp.float32(params_dict["c1"])  # coefficient of the linear basis function
         c2 = jnp.float32(params_dict["c2"])  # coefficient of the quadratic basis function
         det_response = jnp.float32(constants.det_response)
 
-        return jnp.exp(c1 * P1 + c2 * P2) * det_response
+        return c1 * P1 + c2 * P2 + jnp.log(det_response)
 
-    return orthogonal_poly_sed
+    return orthogonal_poly_log_sed
 
 # -------------------------------------------------------------------
 # 3. Fourier Domain Pulse Functions (T)
@@ -228,7 +241,7 @@ def setup_model(
     constants_dict: dict,
     freqs_channels: jnp.ndarray,
     times: jnp.ndarray,
-    sed_fn: Callable = running_power_law_sed,
+    sed_fn: Callable = running_power_law_log_sed,
     pulse_fn: Callable = scattered_gaussian_fd_pulse,
     fourier_freqs=None,
     _wraparoundFDdiagnostic: bool = True,
@@ -239,6 +252,7 @@ def setup_model(
     constants_dict: dict of each constant in the model
     freqs_channels: array of frequency channels in the data
     times: array of time bins in the data
+    sed_fn: returns ln F (see Section 2), not F
     _wraparoundFDdiagnostic: if True, also builds the same model on the two frequencies
         [f1/2, f1], f1 = 1 / W_seg, and attaches it as `.low`. The likelihoods use it to
         record the wraparound ratio. The inner call sets this False, so it does not recurse.
@@ -256,15 +270,37 @@ def setup_model(
         Model of a single pulse, which will be summed in the forward model for multi-pulse signals.
 
         params_dict: dict of each parameter of the pulse
-        """
-        # Linear amplitude scaling; defaults to 1.0 if 'A' is omitted e.g. in fluence-marginalized likelihood
-        A = jnp.float32(params_dict.get("A", 1.0))
 
-        F = sed_fn(params_dict, grid, constants)
+        With 'A' in params_dict (fluence priors): returns A F T, the pulse at that fluence.
+
+        Without 'A' (A_snr and marginalized likelihoods, which set the amplitude themselves):
+        returns the template with its SED scaled to peak at exactly 1 across the channels,
+
+            exp(ln F - max_a ln F_a) T  =  F T / max_a F_a,
+
+        which cannot overflow for any spectral parameters. The factor removed, max_a F_a, is
+        one positive number per pulse; those likelihoods only ever use the template times a
+        free amplitude, so it cancels from the fit, and they convert the amplitude back to
+        fluence with `log_sed_peak` below.
+        """
+        lnF = sed_fn(params_dict, grid, constants)  # (nfreq, 1), the log of the SED
         T = pulse_fn(params_dict, grid, constants)
 
-        M = A * F * T
-        return M
+        if "A" in params_dict:
+            # A F = sign(A) exp(ln|A| + ln F): combined in log space, so a huge F times a small A
+            # never overflows on the way to a moderate product. The sign is carried separately so
+            # a negative A (e.g. a rejected full-normal fluence draw being plotted) still evaluates.
+            A = jnp.float32(params_dict["A"])
+            return jnp.sign(A) * jnp.exp(jnp.log(jnp.abs(A)) + lnF) * T
+
+        return jnp.exp(lnF - jnp.max(lnF)) * T
+
+    def log_sed_peak(params_dict):
+        """
+        ln max_a F_a: the log of the factor single_pulse_model divides out when 'A' is absent.
+        An amplitude B on that normalized template is the fluence A = B exp(-log_sed_peak).
+        """
+        return jnp.max(sed_fn(params_dict, grid, constants))
 
     # Recorded so a saved fit can say which SED and pulse forms produced it; the returned
     # closure is always named single_pulse_model, which says nothing about its contents
@@ -273,6 +309,7 @@ def setup_model(
     single_pulse_model.grid = grid
     single_pulse_model.sed_fn = sed_fn.__name__
     single_pulse_model.pulse_fn = pulse_fn.__name__
+    single_pulse_model.log_sed_peak = log_sed_peak
 
     if _wraparoundFDdiagnostic:
         t = jnp.asarray(times, dtype=jnp.float32).reshape(-1)
