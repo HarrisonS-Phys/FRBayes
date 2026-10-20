@@ -30,6 +30,7 @@ import numpy as np
 import numpyro.distributions as dist
 from numpyro.distributions.transforms import biject_to
 from numpyro.infer import MCMC, NUTS, init_to_value
+from functools import partial
 
 from likelihood import (
     FD_gaussianlikelihood,
@@ -213,41 +214,72 @@ def _interior(distribution, value, margin=1e-3):
     return min(max(value, low + pad), high - pad)
 
 
+def init_to_value_random_times(site=None, values={}, time_param="mean_arrival_time", time_prior=None):
+    """
+    init_to_value for every site except the arrival times, which each chain draws at random from
+    their prior, using the random key NumPyro gives that chain's initialization, so every chain
+    starts from a different arrangement of pulses.
+
+    Unordered times: the arrival-time site itself is drawn from the prior.
+    Ordered times: the sampled site is the unconstrained base vector z of
+    sample_ordered_arrival_times, whose own prior is a standard normal; drawing z from that would
+    bunch the times in the middle of the window. Instead the times are drawn from the arrival-time
+    prior and z = (map to support)^-1 (t), which sample_ordered_arrival_times sorts and maps back
+    to exactly those times.
+
+    NumPyro requires an initialization strategy in this partial form.
+    """
+    if site is None:
+        return partial(init_to_value_random_times, values=values, time_param=time_param,
+                       time_prior=time_prior)
+    if site["type"] == "sample" and site["name"] in (time_param, f"{time_param}_base"):
+        key = site["kwargs"].get("rng_key")
+        if key is None:
+            key = jax.random.PRNGKey(0)
+        times = time_prior.sample(key, site["fn"].shape())
+        if site["name"] == time_param:
+            return times
+        return biject_to(time_prior.support).inv(times)
+    return init_to_value(site, values=values)
+
+
 def default_init(
-    burst, 
-    priors: Dict[str, dist.Distribution], 
+    burst,
+    priors: Dict[str, dist.Distribution],
     n_pulses: int = 1,
     time_param: str = "mean_arrival_time",
-    ordered_times: bool = True, # Strict time ordering prior on pulses
+    ordered_times: bool = True,  # Strict time ordering prior on pulses
+    random_times: bool = True,   # each chain draws its own arrival times from the prior
 ):
     """
-    Starts the sampler from a broad pulse in the middle of the segment, with no residual
-    dispersion, a flat spectrum and little scattering, split evenly among the pulses.
+    Starts the sampler from broad pulses with no residual dispersion, a flat spectrum, little
+    scattering and a modest amplitude.
 
     Starting broad matters because the priors span the whole segment: a narrow starting pulse
     that misses the burst has no overlap with it, so the likelihood has no gradient pointing
-    toward it. A pulse covering most of the segment overlaps the burst wherever it is, and
-    warmup narrows it down.
+    toward it. A broad pulse overlaps nearby features wherever it starts, and warmup narrows it.
+    A flat spectrum (c1 = c2 = 0, or gamma = beta = 0) lets a pulse respond to emission anywhere
+    in the band. A_snr starts at 5 because the likelihood's pull on a pulse's arrival time is
+    proportional to its amplitude: a pulse starting near zero feels no pull toward any feature;
+    at 5 it does, and the likelihood then decides whether it grows or switches off.
 
-    One pulse: width sigma_1 = 0.9 * (upper bound of the sigma prior), centred on the middle
-    of the segment.
+    Widths: sigma = 0.9 * (upper bound of the sigma prior) for every pulse. With priors from
+    set_priors(..., n_pulses=n) that bound is already the single-pulse bound divided by n.
 
-    n pulses: the same region is shared out. Each pulse has width sigma_1 / n, and the centres
-    are evenly spaced about the middle of the segment, 2 sigma_1 / n apart:
+    Arrival times:
+      random_times=True (default): every chain draws its own times uniformly from the arrival-time
+        prior (see init_to_value_random_times), so different chains start from different
+        arrangements of pulses and together explore more of the possible solutions. Intended for
+        running many chains and keeping the best.
+      random_times=False: the same times for every chain, evenly spaced about the middle of the
+        segment, 2 sigma apart:  t_j = W_seg / 2 + 2 sigma (j - (n - 1) / 2).
 
-        t_j = W_seg / 2 + (2 sigma_1 / n) (j - (n - 1) / 2),    j = 0, ..., n - 1
-
-    so together they tile the central +-sigma_1 of the single-pulse start, and neighbouring
-    pulses are two of their own widths apart, which keeps their initial overlap modest. Every
-    other parameter starts at the same value for all pulses; the arrival times are what
-    distinguish them, and they are distinct and ordered, as the ordering prior requires.
-
-    Only parameters present in `priors` are set; the rest use NumPyro's default. Values are
-    moved just inside their prior bounds if they would fall outside them, e.g. a width
-    sigma_1 / n below the resolvability floor.
+    Only parameters present in `priors` are set; the rest use NumPyro's default. Values are moved
+    just inside their prior bounds if they would fall outside them.
     """
     W_seg = burst.n_time * burst.dt
-    targets = {"DM": 0.0, "c1": 0.0, "c2": 0.0, "gamma": 0.0, "beta": 0.0, "tau_ref": 5.0 * burst.dt}
+    targets = {"DM": 0.0, "c1": 0.0, "c2": 0.0, "gamma": 0.0, "beta": 0.0,
+               "tau_ref": 5.0 * burst.dt, "A_snr": 5.0}
 
     sigma_init = None
     if getattr(priors.get("sigma"), "high", None) is not None:
@@ -265,6 +297,10 @@ def default_init(
         values[f"{name}_shared"] = values[name][0]
 
     # ---- arrival times ----
+    if time_param in priors and random_times:
+        return init_to_value_random_times(values=values, time_param=time_param,
+                                          time_prior=priors[time_param])
+
     if time_param in priors:
         time_prior = priors[time_param]
         offsets = np.arange(n_pulses) - 0.5 * (n_pulses - 1)
@@ -283,7 +319,6 @@ def default_init(
             )
 
     return init_to_value(values=values)
-
 
 def run_fit(
     burst,
