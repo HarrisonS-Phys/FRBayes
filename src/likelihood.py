@@ -926,7 +926,7 @@ def FD_gaussianlikelihood(
     containment_FD: dict = None,
     spectral_coeff_map: dict = None,
     ordered_times: bool = True, # Strict time ordering prior on pulses
-    repulsion: dict = None # TO REMOVE
+    repulsion: dict | None = {},      # {} = on, with repulsive_toa_prior's defaults; None = off
 ):
     """
     Fourier-domain Gaussian likelihood with fluences sampled directly (not marginalized),

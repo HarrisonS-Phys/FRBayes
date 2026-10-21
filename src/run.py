@@ -48,7 +48,7 @@ from likelihood import (
 )
 from priors import dispersion_prior_bounds, spectral_coeff_bounds, width_prior_bounds
 from results import describe_priors
-
+import inspect
 
 # Likelihoods run_fit supports, by how they treat the fluence
 MARGINALIZED = (FD_marg_halfnormal_nooverlap_gaussianlikelihood, FD_marg_fullnormal_gaussianlikelihood)
@@ -549,7 +549,13 @@ def run_fit(
     mcmc.seed = seed                  # the seed actually used; save_run records it
     mcmc.priors = dict(priors)                          # as passed in (a marginalized fit keeps A_snr here)
     mcmc.n_pulses = n_pulses
-    mcmc.likelihood_kwargs = dict(likelihood_kwargs)    # e.g. repulsion, shared_params, ordered_times
+    # Record what actually ran: the likelihood's own defaults (e.g. repulsion is on unless turned
+    # off), what was passed, and run_fit's settings the likelihood receives
+    passed_by_run_fit = filled_in | {"shared_params", "ordered_times"}
+    defaults = {name: p.default for name, p in inspect.signature(likelihood).parameters.items()
+                if p.default is not inspect.Parameter.empty and name not in passed_by_run_fit}
+    mcmc.likelihood_kwargs = {**defaults, **likelihood_kwargs,
+                              "shared_params": shared_params, "ordered_times": ordered_times}
 
     return mcmc
 
