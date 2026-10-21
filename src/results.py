@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 from arviz_base import from_dict
+import arviz as az
 
 
 def _fn_name(fn):

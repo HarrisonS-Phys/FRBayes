@@ -1,10 +1,15 @@
 """
 run.py - Priors, sampling, and post-processing for a fit of one burst.
 
-A fit is three calls, followed by saving with results.save_run:
+First choose the device, before anything imports jax (see devices.py):
 
-    priors = set_priors(burst, single_pulse_fn, s_opt=100.0)
-    mcmc   = run_fit(burst, single_pulse_fn, priors, FD_gaussianlikelihood)
+    from devices import use_device
+    use_device("auto")          # or "gpu" / "cpu"
+
+A fit is then three calls, followed by saving with results.save_run:
+
+    priors = set_priors(burst, single_pulse_fn, n_pulses, s_opt=100.0)
+    mcmc   = run_fit(burst, single_pulse_fn, priors, FD_gaussianlikelihood, n_pulses=n_pulses)
     extra  = posthoc_samples(mcmc, burst, single_pulse_fn, priors)
     idata  = save_run(out_path, mcmc, burst, priors, data_path,
                       single_pulse_fn=single_pulse_fn, extra_samples=extra)
@@ -76,10 +81,18 @@ def set_priors(
     Defaults:
         mean_arrival_time  Uniform over the segment
         DM                 Uniform(-D_max, D_max), from dispersion_prior_bounds
-        sigma, tau_ref     Uniform, from width_prior_bounds at `toa`
+        sigma, tau_ref     Uniform, from width_prior_bounds at `toa`; the upper bound on sigma
+                           is divided by n_pulses
         c1, c2             Uniform, from spectral_coeff_bounds mapping the (gamma, beta) box
         A_snr              HalfNormal(s_opt), only if s_opt is given
 
+    burst:       the ConditionedData of the burst; its segment length, time resolution, band
+                 and spectral basis set the default bounds.
+    single_pulse_fn:
+                 the model closure from model.setup_model. Used for the DM bounds, and to check
+                 that the spectral parameters match its SED.
+    n_pulses:    number of pulses the fit will use; must be the same n_pulses passed to run_fit.
+                 Each pulse gets 1/n_pulses of the single-pulse upper bound on sigma.
     toa:         arrival time the width bounds are computed for (s, relative to the segment
                  start). Defaults to the middle of the segment, which gives the widest bound on
                  sigma. The bounds assume the pulse sits there: a draw near the edge of the
@@ -91,13 +104,15 @@ def set_priors(
     gamma_range, beta_range:
                  the catalogue-wide box in (gamma, beta) that the c1, c2 bounds are mapped from.
                  Ignored if gamma and beta are given as overrides.
+    verbose:     print each prior once the dictionary is built.
     overrides:   name=distribution replaces a default, or adds a parameter (A=..., delta=...).
                  name=None removes a default, e.g. sigma=None, tau_ref=None when the widths are
                  drawn jointly by `containment` instead.
 
     Raises if: any value is not a NumPyro distribution; both 'A' and 'A_snr' are set; the
     orthogonal (c1, c2) and physical (gamma, beta) spectral parameters are mixed or only one
-    of a pair is given; or the spectral parameters do not match the SED of `single_pulse_fn`.
+    of a pair is given; the spectral parameters do not match the SED of `single_pulse_fn`; or
+    n_pulses is so large that the upper bound on sigma falls below its lower bound.
     """
     W_seg = burst.n_time * burst.dt
     if toa is None:
@@ -180,6 +195,8 @@ def _marginalized_s_opt(priors: Dict[str, dist.Distribution]) -> float:
     """
     s_opt for a marginalized likelihood, read from the 'A_snr' prior.
 
+    priors: the priors dictionary of the fit, as returned by set_priors.
+
     Both marginalized likelihoods correspond to a HalfNormal(s_opt) prior on the amplitude in SNR
     units: the half-normal one integrates over it directly, and the full-normal one integrates
     over the zero-mean normal and becomes that prior once draws with a negative fluence are
@@ -204,8 +221,24 @@ def _marginalized_s_opt(priors: Dict[str, dist.Distribution]) -> float:
 # 2. Sampling
 # -------------------------------------------------------------------
 
+# ---- Starting point of the sampler ----
+#
+# default_init builds it in two parts:
+#   every parameter except the arrival times:  _starting_values, the same in every chain
+#   the arrival times:                         random_init_times=True  (DEFAULT) each chain draws
+#                                                  its own from the prior (init_to_value_random_times)
+#                                              random_init_times=False (ALTERNATIVE) the same
+#                                                  evenly spaced times in every chain
+#                                                  (_evenly_spaced_times)
+
 def _interior(distribution, value, margin=1e-3):
-    """Moves `value` just inside the bounds of a bounded distribution; unbounded ones pass through."""
+    """
+    Moves `value` just inside the bounds of a bounded distribution; unbounded ones pass through.
+
+    distribution: the prior the value must lie inside
+    value:        the starting value to move
+    margin:       how far inside the bounds to stay, as a fraction of the prior's range
+    """
     low, high = getattr(distribution, "low", None), getattr(distribution, "high", None)
     if low is None or high is None:
         return value
@@ -214,70 +247,18 @@ def _interior(distribution, value, margin=1e-3):
     return min(max(value, low + pad), high - pad)
 
 
-def init_to_value_random_times(site=None, values={}, time_param="mean_arrival_time", time_prior=None):
+def _starting_values(burst, priors: Dict[str, dist.Distribution], n_pulses: int):
     """
-    init_to_value for every site except the arrival times, which each chain draws at random from
-    their prior, using the random key NumPyro gives that chain's initialization, so every chain
-    starts from a different arrangement of pulses.
+    Starting values for every parameter EXCEPT the arrival times, the same in every chain.
+    Returns (values, sigma_init): `values` maps site names to arrays of shape (n_pulses,), and
+    sigma_init is the starting width (None if the sigma prior has no upper bound).
 
-    Unordered times: the arrival-time site itself is drawn from the prior.
-    Ordered times: the sampled site is the unconstrained base vector z of
-    sample_ordered_arrival_times, whose own prior is a standard normal; drawing z from that would
-    bunch the times in the middle of the window. Instead the times are drawn from the arrival-time
-    prior and z = (map to support)^-1 (t), which sample_ordered_arrival_times sorts and maps back
-    to exactly those times.
+    burst:    the ConditionedData of the burst; its time resolution sets the starting scattering
+    priors:   the priors the model samples; only parameters present in it get a starting value
+    n_pulses: number of pulses in the fit
 
-    NumPyro requires an initialization strategy in this partial form.
+    See default_init for why each value is chosen.
     """
-    if site is None:
-        return partial(init_to_value_random_times, values=values, time_param=time_param,
-                       time_prior=time_prior)
-    if site["type"] == "sample" and site["name"] in (time_param, f"{time_param}_base"):
-        key = site["kwargs"].get("rng_key")
-        if key is None:
-            key = jax.random.PRNGKey(0)
-        times = time_prior.sample(key, site["fn"].shape())
-        if site["name"] == time_param:
-            return times
-        return biject_to(time_prior.support).inv(times)
-    return init_to_value(site, values=values)
-
-
-def default_init(
-    burst,
-    priors: Dict[str, dist.Distribution],
-    n_pulses: int = 1,
-    time_param: str = "mean_arrival_time",
-    ordered_times: bool = False,  # Strict time ordering prior on pulses
-    random_init_times: bool = True,   # each chain draws its own arrival times from the prior
-):
-    """
-    Starts the sampler from broad pulses with no residual dispersion, a flat spectrum, little
-    scattering and a modest amplitude.
-
-    Starting broad matters because the priors span the whole segment: a narrow starting pulse
-    that misses the burst has no overlap with it, so the likelihood has no gradient pointing
-    toward it. A broad pulse overlaps nearby features wherever it starts, and warmup narrows it.
-    A flat spectrum (c1 = c2 = 0, or gamma = beta = 0) lets a pulse respond to emission anywhere
-    in the band. A_snr starts at 5 because the likelihood's pull on a pulse's arrival time is
-    proportional to its amplitude: a pulse starting near zero feels no pull toward any feature;
-    at 5 it does, and the likelihood then decides whether it grows or switches off.
-
-    Widths: sigma = 0.9 * (upper bound of the sigma prior) for every pulse. With priors from
-    set_priors(..., n_pulses=n) that bound is already the single-pulse bound divided by n.
-
-    Arrival times:
-      random_init_times=True (default): every chain draws its own times uniformly from the arrival-time
-        prior (see init_to_value_random_times), so different chains start from different
-        arrangements of pulses and together explore more of the possible solutions. Intended for
-        running many chains and keeping the best.
-      random_init_times=False: the same times for every chain, evenly spaced about the middle of the
-        segment, 2 sigma apart:  t_j = W_seg / 2 + 2 sigma (j - (n - 1) / 2).
-
-    Only parameters present in `priors` are set; the rest use NumPyro's default. Values are moved
-    just inside their prior bounds if they would fall outside them.
-    """
-    W_seg = burst.n_time * burst.dt
     targets = {"DM": 0.0, "c1": 0.0, "c2": 0.0, "gamma": 0.0, "beta": 0.0,
                "tau_ref": 5.0 * burst.dt, "A_snr": 5.0}
 
@@ -296,27 +277,133 @@ def default_init(
     for name in list(values):
         values[f"{name}_shared"] = values[name][0]
 
-    # ---- arrival times ----
-    if time_param in priors and random_init_times:
+    return values, sigma_init
+
+
+def init_to_value_random_times(site=None, values={}, time_param="mean_arrival_time", time_prior=None):
+    """
+    DEFAULT arrival-time start. init_to_value for every site except the arrival times, which each
+    chain draws at random from their prior, using the random key NumPyro gives that chain's
+    initialization, so every chain starts from a different arrangement of pulses.
+
+    Unordered times: the arrival-time site itself is drawn from the prior.
+    Ordered times: the sampled site is the unconstrained base vector z of
+    sample_ordered_arrival_times, whose own prior is a standard normal; drawing z from that would
+    bunch the times in the middle of the window. Instead the times are drawn from the arrival-time
+    prior and z = (map to support)^-1 (t), which sample_ordered_arrival_times sorts and maps back
+    to exactly those times. Both cases are recognized from the site name, so this strategy does
+    not need to be told which one the likelihood uses.
+
+    site:       the sample site NumPyro asks a starting value for. None returns the strategy
+                itself, in the partial form NumPyro requires.
+    values:     starting values for every other site, as for init_to_value
+    time_param: name of the arrival-time site
+    time_prior: the arrival-time prior the times are drawn from
+    """
+    if site is None:
+        return partial(init_to_value_random_times, values=values, time_param=time_param,
+                       time_prior=time_prior)
+    if site["type"] == "sample" and site["name"] in (time_param, f"{time_param}_base"):
+        key = site["kwargs"].get("rng_key")
+        if key is None:
+            key = jax.random.PRNGKey(0)
+        times = time_prior.sample(key, site["fn"].shape())
+        if site["name"] == time_param:
+            return times
+        return biject_to(time_prior.support).inv(times)
+    return init_to_value(site, values=values)
+
+
+def _evenly_spaced_times(burst, time_prior, n_pulses: int, sigma_init):
+    """
+    ALTERNATIVE arrival-time start: the same times for every chain, evenly spaced about the middle
+    of the segment, 2 sigma_init apart,
+
+        t_j = W_seg / 2 + 2 sigma_init (j - (n_pulses - 1) / 2),
+
+    or W_seg / (2 n_pulses) apart if sigma has no upper bound (sigma_init None). Each time is
+    moved just inside the prior bounds.
+
+    burst:      the ConditionedData of the burst; its length sets the middle of the segment
+    time_prior: the arrival-time prior
+    n_pulses:   number of pulses in the fit
+    sigma_init: the starting width, from _starting_values
+    """
+    W_seg = burst.n_time * burst.dt
+    offsets = np.arange(n_pulses) - 0.5 * (n_pulses - 1)
+    spacing = 2.0 * sigma_init if sigma_init is not None else W_seg / (2.0 * n_pulses)
+    times = [_interior(time_prior, 0.5 * W_seg + spacing * k) for k in offsets]
+    return jnp.asarray(times, dtype=jnp.float32)
+
+
+def default_init(
+    burst,
+    priors: Dict[str, dist.Distribution],
+    n_pulses: int = 1,
+    time_param: str = "mean_arrival_time",
+    ordered_times: bool = False,  # Strict time ordering prior on pulses
+    random_init_times: bool = True,   # each chain draws its own arrival times from the prior
+):
+    """
+    Starting point of the sampler: broad pulses with no residual dispersion, a flat spectrum,
+    little scattering and a modest amplitude, at arrival times drawn at random for each chain
+    (default) or evenly spaced.
+
+    Every parameter except the arrival times (_starting_values), the same in every chain:
+      Starting broad matters because the priors span the whole segment: a narrow starting pulse
+      that misses the burst has no overlap with it, so the likelihood has no gradient pointing
+      toward it. A broad pulse overlaps nearby features wherever it starts, and warmup narrows it.
+      Widths: sigma = 0.9 * (upper bound of the sigma prior) for every pulse. With priors from
+      set_priors(..., n_pulses=n) that bound is already the single-pulse bound divided by n.
+      A flat spectrum (c1 = c2 = 0, or gamma = beta = 0) lets a pulse respond to emission anywhere
+      in the band. A_snr starts at 5 because the likelihood's pull on a pulse's arrival time is
+      proportional to its amplitude: a pulse starting near zero feels no pull toward any feature;
+      at 5 it does, and the likelihood then decides whether it grows or switches off.
+
+    Arrival times:
+      random_init_times=True (DEFAULT): every chain draws its own times from the arrival-time
+        prior (init_to_value_random_times), so different chains start from different
+        arrangements of pulses and together explore more of the possible solutions. Intended for
+        running many chains and keeping the best.
+      random_init_times=False (ALTERNATIVE): the same times for every chain, evenly spaced about
+        the middle of the segment, 2 sigma apart (_evenly_spaced_times). Chains then differ only
+        through the sampler's own randomness.
+
+    burst:             the ConditionedData of the burst
+    priors:            the priors the model samples. run_fit passes them with 'A_snr' removed for
+                       a marginalized likelihood. Only parameters present get a starting value;
+                       the rest use NumPyro's default.
+    n_pulses:          number of pulses in the fit
+    time_param:        name of the arrival-time site
+    ordered_times:     must match the likelihood's ordered_times, since ordered times are sampled
+                       through a different site ('<time_param>_base'). Only the evenly spaced start
+                       uses it; the random start recognizes the site by its name.
+    random_init_times: True for the random start (default), False for the evenly spaced one.
+
+    Values are moved just inside their prior bounds if they would fall outside them.
+    """
+    values, sigma_init = _starting_values(burst, priors, n_pulses)
+
+    if time_param not in priors:
+        return init_to_value(values=values)
+
+    time_prior = priors[time_param]
+
+    # DEFAULT: each chain draws its own arrival times from the prior
+    if random_init_times:
         return init_to_value_random_times(values=values, time_param=time_param,
-                                          time_prior=priors[time_param])
+                                          time_prior=time_prior)
 
-    if time_param in priors:
-        time_prior = priors[time_param]
-        offsets = np.arange(n_pulses) - 0.5 * (n_pulses - 1)
-        spacing = 2.0 * sigma_init if sigma_init is not None else W_seg / (2.0 * n_pulses)
-        times = [_interior(time_prior, 0.5 * W_seg + spacing * k) for k in offsets]
-
-        if n_pulses == 1 or not ordered_times:
-            values[time_param] = jnp.asarray(times, dtype=jnp.float32)
-        else:
-            # With several pulses the sampled site is the unconstrained base vector z of
-            # sample_ordered_arrival_times, which sorts z and maps it into the prior's support.
-            # Setting z = (that map)^-1 (t) therefore starts the arrival times at exactly t.
-            to_support = biject_to(time_prior.support)
-            values[f"{time_param}_base"] = jnp.asarray(
-                to_support.inv(jnp.asarray(times, dtype=jnp.float32)), dtype=jnp.float32
-            )
+    # ALTERNATIVE: the same evenly spaced arrival times in every chain
+    times = _evenly_spaced_times(burst, time_prior, n_pulses, sigma_init)
+    if n_pulses == 1 or not ordered_times:
+        values[time_param] = times
+    else:
+        # With several pulses the sampled site is the unconstrained base vector z of
+        # sample_ordered_arrival_times, which sorts z and maps it into the prior's support.
+        # Setting z = (that map)^-1 (t) therefore starts the arrival times at exactly t.
+        to_support = biject_to(time_prior.support)
+        values[f"{time_param}_base"] = jnp.asarray(to_support.inv(times), dtype=jnp.float32)
 
     return init_to_value(values=values)
 
@@ -326,14 +413,14 @@ def run_fit(
     priors: Dict[str, dist.Distribution],
     likelihood: Callable,
     n_pulses: int = 1,
-    num_warmup: int = 1000,
+    num_warmup: int = 500,
     num_samples: int = 200,
     num_chains: int = 1,
-    seed: int = 0,
+    seed: int = None,
     init_strategy=None,
     dense_mass: bool = True,
-    max_tree_depth: int | tuple[int, int] = 10,    # or (warmup, sampling), e.g. (10, 8), # int, or (warmup, sampling) e.g. (10, 8)
-    chain_method: str = "parallel",
+    max_tree_depth: int | tuple[int, int] = (10,8),  # int, or (warmup, sampling) e.g. (10, 8)
+    chain_method: str = "auto",
     progress_bar: bool = True,
     shared_params: tuple = ("DM", "tau_ref"),
     extra_fields=("num_steps", "accept_prob", "diverging", "potential_energy"),
@@ -345,14 +432,52 @@ def run_fit(
     """
     Runs NUTS on one burst and returns the finished MCMC object.
 
-    likelihood:        the likelihood function itself, one of MARGINALIZED or UNMARGINALIZED
+    burst:             the ConditionedData of the burst: the data, noise and spectral basis
+    single_pulse_fn:   the model closure from model.setup_model
     priors:            as returned by set_priors. For a marginalized likelihood, 'A_snr' is
                        removed before sampling and its scale passed as `s_opt`; the dictionary
                        passed in is not modified, so it can be saved as-is.
-    init_strategy:     None uses default_init: a broad pulse in the middle of the segment, or for
-                       several pulses that region shared out evenly among them
-    shared_params: parameters sampled once and used by every pulse (sampled as '<name>_shared',
-                   recorded per pulse under the usual name). () keeps every parameter per-pulse.
+    likelihood:        the likelihood function itself, one of MARGINALIZED or UNMARGINALIZED
+    n_pulses:          number of pulses; must be the same n_pulses passed to set_priors
+    num_warmup:        warmup steps per chain, in which the step size and mass matrix are adapted
+                       and then discarded. With dense_mass, keep at least 500: the final mass
+                       matrix is estimated from the last warmup window only, which is 200 draws
+                       at 500 and 100 at 300.
+    num_samples:       draws kept per chain after warmup
+    num_chains:        number of chains. On the CPU, up to as many as devices.use_device created
+                       run in parallel; on a GPU all run as one batch.
+    seed:              integer the run's random key is made from; None draws one at random.
+                       Either way the seed used is printed and stored as mcmc.seed, which
+                       save_run records, so any run can be repeated exactly.
+    init_strategy:     a NumPyro initialization strategy. None uses default_init, with the
+                       ordered_times and random_init_times given here: by default, broad pulses
+                       at arrival times drawn at random for each chain.
+    dense_mass:        True adapts a full covariance mass matrix, which follows correlations
+                       between parameters (e.g. arrival time, width and scattering); False a
+                       diagonal one.
+    max_tree_depth:    largest NUTS tree depth d, i.e. at most 2^d - 1 leapfrog steps per draw.
+                       An int applies to warmup and sampling; a pair (warmup, sampling), e.g.
+                       (10, 8), sets them separately.
+    chain_method:      "auto" matches the device chosen with devices.use_device: on a GPU all
+                       chains run as one batch ("vectorized"); on the CPU one chain per device
+                       ("parallel"), and NumPyro runs chains one after another, with a warning,
+                       if num_chains exceeds the devices. Any NumPyro chain_method ("parallel",
+                       "vectorized", "sequential") can also be given directly.
+    progress_bar:      show NumPyro's progress bar
+    shared_params:     parameters sampled once and used by every pulse (sampled as
+                       '<name>_shared', recorded per pulse under the usual name). () keeps every
+                       parameter per-pulse.
+    extra_fields:      per-draw sampler quantities stored beside the samples, read with
+                       mcmc.get_extra_fields(): leapfrog steps (tree depth), acceptance
+                       probability, divergences, and potential energy (for comparing chains).
+    target_accept_prob: mean acceptance probability the step size is tuned for. Higher gives
+                       smaller steps and fewer divergences, at the cost of longer trajectories.
+    ordered_times:     True samples the arrival times in increasing order
+                       (sample_ordered_arrival_times); False samples them independently, and
+                       pulses are relabeled after sampling.
+    random_init_times: passed to default_init: True (default) draws each chain's starting arrival
+                       times at random, False starts every chain from the same evenly spaced
+                       times. Ignored if init_strategy is given.
     likelihood_kwargs: passed straight to the likelihood, e.g. containment=, containment_FD=,
                        apply_overlap_prior=. Arguments run_fit fills in itself (the data, priors,
                        model, spectral_coeff_map and s_opt) cannot be given here.
@@ -393,9 +518,14 @@ def run_fit(
     print(f"run_fit seed: {seed}")
 
     if init_strategy is None:
-        init_strategy = default_init(burst, model_priors, n_pulses, ordered_times)
+        init_strategy = default_init(burst, model_priors, n_pulses, ordered_times=ordered_times,
+                                     random_init_times=random_init_times)
 
-    kernel = NUTS(likelihood, dense_mass=dense_mass, init_strategy=init_strategy, 
+    if chain_method == "auto":
+        # GPU: all chains as one batch on the single device. CPU: one chain per device.
+        chain_method = "parallel" if jax.default_backend() == "cpu" else "vectorized"
+
+    kernel = NUTS(likelihood, dense_mass=dense_mass, init_strategy=init_strategy,
                   max_tree_depth=max_tree_depth, target_accept_prob=target_accept_prob)
     mcmc = MCMC(kernel, num_warmup=num_warmup, num_samples=num_samples, num_chains=num_chains,
                 chain_method=chain_method, progress_bar=progress_bar)
@@ -450,6 +580,13 @@ def posthoc_samples(
                             A_accept == 0 must be discarded, from EVERY posterior variable: the
                             retained draws are exact samples under the positive fluence prior.
                             They are flagged rather than removed so the (chain, draw) shape holds.
+
+    mcmc:            the finished MCMC object from run_fit
+    burst:           the ConditionedData the fit used; its noise levels weight the wraparound ratio
+    single_pulse_fn: the model closure the fit used
+    priors:          the priors passed to run_fit, still containing 'A_snr', whose scale is s_opt
+    seed:            integer the random key of the fluence draws is made from. Must be given for a
+                     marginalized likelihood: jax.random.PRNGKey(None) raises.
 
     The likelihood is read from mcmc itself, and s_opt from the 'A_snr' prior, so neither can
     differ from what the fit used.
