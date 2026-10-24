@@ -10,9 +10,9 @@ CONVENTIONS (must match model.py and likelihood.py):
 1. FOURIER TRANSFORM: d_tilde = dt * rfft(d), so the model's templates share the convention.
 2. NOISE: `sigma_noise_fd` is the standard deviation of the real (equivalently, imaginary) part of
    each retained Fourier bin, dt * varsigma_a * sqrt(N / 2) for white noise.
-3. RETAINED BINS: DC is dropped, because it is set by each channel's baseline level, which the
-   model does not include; the Fourier truncation removes Nyquist along with the rest of the
-   upper band. `fourier_freqs` is exactly the set of bins kept, and the likelihood uses all of
+3. RETAINED BINS: DC is dropped because, with limited off-pulse data, it is dominated by the
+   error of the subtracted baseline (see `truncate_fourier`); the Fourier truncation removes
+   Nyquist along with the rest of the upper band. `fourier_freqs` is exactly the set of bins kept, and the likelihood uses all of
    them, so the choice made here is the only place the bin selection lives.
 4. TIMES are returned relative to the segment start, as model.py requires for float32.
 """
@@ -151,6 +151,15 @@ def truncate_fourier(data_fd, fourier_freqs_full, fd_downsample):
     """
     Keeps the lowest 1 / fd_downsample of the Fourier bins, and drops DC.
 
+    WHY DC IS DROPPED. DC is the sum over the segment, so it carries each channel's fluence, but
+    also the error of the baseline subtracted in prepare_burst. That baseline is the median of
+    M = n_noise_bins off-pulse bins, so its error is the same in all N samples: it adds
+    coherently (variance N^2 Var(baseline), against the N varsigma^2 of DC's own noise) and lands
+    only in DC, since a constant has no power at f != 0. With Var(median) ~ (pi/2) varsigma^2 / M
+    the DC variance is inflated by 1 + (pi/2) N/M (1 + N/M for a mean) -- ~9x for M = N/5. DC
+    would then add ~1-2% of the SNR^2, about the fluence and spectrum only, while being the one
+    bin exposed to baseline errors and drifts; dropping it makes the fit insensitive to them.
+
     The template's Gaussian factor exp(-2 pi^2 sigma^2 f^2) kills it well below Nyquist, so the
     upper bins are noise-dominated and carry no information about any parameter. Unlike
     downsampling in time this is an exact low-pass with no aliasing, and it leaves the number of
@@ -288,6 +297,10 @@ def prepare_burst(path, event_id=None, n_avg=8, fd_downsample=4, toa=None, exclu
     median_noise_td, sigma_noise_td, n_noise_bins = estimate_noise(
         data_td, dt, toa, exclude_fraction, noise_fraction, verbose
     )
+    # For display only: puts each channel's off-pulse level at zero in the stored data_td. It has
+    # no effect on the fit, since subtracting a constant from a channel changes only its DC bin,
+    # which truncate_fourier drops; data_fd on the retained bins, the channel weights and the
+    # likelihood are identical with or without it.
     data_td = data_td - median_noise_td
 
     data_fd = jnp.float32(dt) * jnp.fft.rfft(data_td, axis=-1)

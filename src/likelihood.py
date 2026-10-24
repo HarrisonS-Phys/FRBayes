@@ -1,5 +1,5 @@
 """
-likelihoods.py - NumPyro likelihoods for the Fourier-domain FRB pulse model.
+likelihood.py - NumPyro likelihoods for the Fourier-domain FRB pulse model.
 
 CONVENTIONS (must match model.py and the paper):
 1. FOURIER TRANSFORM: data and templates use X_c = dt * sum_b x_b exp(-2 pi i f_c t_b),
@@ -8,12 +8,21 @@ CONVENTIONS (must match model.py and the paper):
    of each Fourier bin. For white noise with per-channel time-domain std varsig_a, this is
    sqrt(N dt^2 varsig_a^2 / 2) for every bin retained below.
 3. DC AND NYQUIST BINS ARE DISCARDED in the Fourier-domain likelihoods:
-   - DC (f = 0) is set by each channel's baseline level, which the model does not include;
-     discarding it makes the fit insensitive to per-channel baseline offsets.
+   - DC (f = 0) carries each channel's fluence, but also the FULL error of the baseline that
+     data.py subtracts. That baseline is estimated from M off-pulse bins (the median of the
+     lead-in before the TOA), so its error is the same in all N samples of the segment: it adds
+     coherently, and lands only in DC, since a constant has no power at f != 0. The DC variance
+     is then inflated by 1 + (pi/2) N/M (1 + N/M for a mean), e.g. ~9x for M = N/5. What DC
+     would add is then ~1-2% of the SNR^2 (its share before inflation is 2 sqrt(pi) sigma / N
+     for a Gaussian pulse of sigma samples), and only about the fluence and spectrum, never
+     timing, width or scattering, while it is the one bin exposed to baseline errors and slow
+     drifts. Discarding it makes the fit exactly insensitive to them. (Its being real-valued is
+     not a reason: that would only change its sigma, by sqrt(2).)
    - Nyquist (f = 1 / (2 dt), present only when N is even) is purely real for real data and
      receives equal aliased contributions from +f and -f, so the continuous-FT template does
      not describe it.
-   These are 2 of ~N/2 bins per channel and carry negligible information for resolved pulses.
+   These are 2 of ~N/2 bins per channel; with limited off-pulse data DC carries little usable
+   information (above), and Nyquist none that the template describes.
    Every retained bin has independent real and imaginary parts of equal variance sigma^2,
    so the noise-weighted inner product is
        <x|y> = sum_{a,c} Re(conj(x_ac) y_ac) / sigma_ac^2,   summed over retained bins c.
