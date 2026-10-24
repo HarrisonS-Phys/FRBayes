@@ -11,6 +11,12 @@ The bounds are deliberately loose. Their job is to stop the sampler wandering so
 periodic Fourier-domain model cannot represent, not to express knowledge about bursts. Each
 parameter alone, at its bound, just fits inside the segment; nothing here constrains the
 combination, which is left to the containment penalty.
+
+With the padded model (setup_model(..., model_duration_pad=...)) the model is no longer periodic
+on the segment, so these bounds no longer guard against wraparound. They then express the
+assumption that the segment contains the pulse, and they set how much padding is needed:
+`model_duration_pad_for_priors` computes the padding that holds all emission they allow outside
+the segment.
 """
 
 import numpy as np
@@ -134,3 +140,78 @@ def spectral_coeff_bounds(spectral_coeff_map, gamma_range, beta_range):
         "c2_min": min(c2s),
         "c2_max": max(c2s),
     }
+
+def _upper_bound(distribution, name):
+    """Upper bound of a bounded prior, e.g. a Uniform; raises for one without a finite bound."""
+    high = getattr(distribution, "high", None)
+    if high is None or not np.isfinite(float(high)):
+        raise ValueError(f"the '{name}' prior has no finite upper bound, so the padding it needs "
+                         f"cannot be computed from it.")
+    return float(high)
+
+
+def model_duration_pad_for_priors(single_pulse_fn, priors, containment=None,
+                                  n_tau=3.0, n_sigma=3.0, verbose=True):
+    """
+    Padding (s) for setup_model(..., model_duration_pad=...) that holds all the emission the
+    priors allow outside the segment [0, W), so that none of it wraps back in, whatever the
+    pulse's spectrum. single_pulse_fn.extend_model_duration(burst, priors) uses it as the upper
+    limit of its search, and usually pads much less: it measures the wrapped emission directly,
+    weighting channels by the burst's own SNR.
+
+    With arrival times in [0, W], a pulse's emission reaches at most
+        before 0:  n_sigma sigma_max + the largest dispersion ADVANCE (top of the band)
+        after W:   n_sigma sigma_max + n_tau tau_bot_max + the largest dispersion DELAY
+                   (bottom of the band)
+    and the padding has to hold both, since emission before 0 lands at the end of the longer
+    window. Scattering is longest at the bottom of the band, tau_bot = tau_ref (nu_bot/nu_ref)^delta,
+    which is why it sets the padding rather than tau_ref itself.
+
+    single_pulse_fn: the model closure (unpadded is fine). Its `.grid` gives the band edges and its
+                     `.constants` give nu_ref, k_DM, epsilon and delta, so the padding and the
+                     model cannot disagree about them.
+    priors:          the priors dictionary, as from run.set_priors; 'sigma', 'tau_ref' and 'DM'
+                     need finite bounds (Uniform). If 'delta' is sampled, its lower bound (the
+                     steepest scattering law) is used.
+    containment:     the `containment` settings, when sigma and tau are drawn jointly by
+                     sample_contained_widths instead of being in priors: their bounds are then
+                     extent_max / n_sigma and extent_max / n_tau (at the bottom of the band),
+                     with that method's own n_sigma and n_tau (defaults 3 and 5)
+    n_tau, n_sigma:  e-folds of the tail and widths of the Gaussian the padding must hold. The
+                     area of an exponential beyond n e-folds is e^-n (5% for 3), and that is
+                     what would still wrap, in the bottom channel.
+    verbose:         print the padding and what sets it, as multiples of the segment duration
+
+    Returns the padding in seconds.
+    """
+    constants = single_pulse_fn.constants
+    nu = np.asarray(single_pulse_fn.grid.freqs_channels, dtype=float).reshape(-1)
+    nu_bot, nu_top, nu_ref = nu.min(), nu.max(), float(constants.freq_channels_ref)
+    # The steepest scattering law the prior allows gives the longest tail at the bottom of the band
+    delta = float(priors["delta"].low) if "delta" in priors else float(constants.delta)
+
+    if "sigma" in priors and "tau_ref" in priors:
+        sigma_max = _upper_bound(priors["sigma"], "sigma")
+        tau_bot_max = _upper_bound(priors["tau_ref"], "tau_ref") * (nu_bot / nu_ref) ** delta
+    elif containment is not None:
+        extent_max = float(containment["extent_max"])
+        sigma_max = extent_max / float(containment.get("n_sigma", 3.0))
+        tau_bot_max = extent_max / float(containment.get("n_tau", 5.0))
+    else:
+        raise ValueError("'sigma' and 'tau_ref' are not both in priors; pass the containment "
+                         "settings that draw them instead.")
+
+    DM_max = 0.0
+    if "DM" in priors:
+        DM_max = max(abs(float(priors["DM"].low)), abs(_upper_bound(priors["DM"], "DM")))
+    eps = constants.epsilon
+    delay_bot = constants.k_DM * DM_max * abs(nu_bot ** eps - nu_ref ** eps)
+    advance_top = constants.k_DM * DM_max * abs(nu_top ** eps - nu_ref ** eps)
+
+    pad = 2.0 * n_sigma * sigma_max + n_tau * tau_bot_max + delay_bot + advance_top
+    if verbose:
+        W = single_pulse_fn.segment_duration
+        print(f"padding = {pad / W:.2f} x the segment duration: Gaussian widths "
+              f"{2 * n_sigma * sigma_max / W:.2f}, scattering tail at the bottom of the band "
+              f"{n_tau * tau_bot_max / W:.2f}, dispersion {(delay_bot + advance_top) / W:.2f}")
+    return float(pad)

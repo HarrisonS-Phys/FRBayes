@@ -642,10 +642,13 @@ def wraparound_ratio_posthoc(samples, fluences, single_pulse_fn, inv_noise_var,
 # evaluates those templates, and applies one of the likelihoods of Sections 2 and 3.
 # -------------------------------------------------------------------
 
-def repulsive_toa_prior(t, sigma, tau, snr, x_min=1.0, w=0.05, K=1000.0, snr_on=3.0, w_snr=0.33):
+def repulsive_toa_prior(t, sigma, tau, snr, x_min=1.0, w=0.05, K=1000.0, snr_on=3.0, w_snr=0.33,
+                        c_ratio=0.25, max_log_ratio=4.0):
     """
     Soft exclusion between pulses that are both active, so that no two can overlap to absorb
     misspecification together, while an idle pulse can still pass freely through an active one.
+    A faint pulse beside a much brighter one must keep further away than two pulses of similar
+    brightness.
 
     WHAT IS SEPARATED: THE SCATTERED PROFILES, NOT JUST THE GAUSSIANS
     Each pulse is a Gaussian (mean t, standard deviation sigma) convolved with the one-sided
@@ -664,12 +667,23 @@ def repulsive_toa_prior(t, sigma, tau, snr, x_min=1.0, w=0.05, K=1000.0, snr_on=
     data than one emitting at the top, although both have the same tau_ref. With tau shared the
     centres shift equally, so x is the arrival-time difference over the scattered widths.
 
+    WHY THE REQUIRED SEPARATION GROWS WITH THE BRIGHTNESS RATIO
+    The misfit a pulse can leave -- the part of the data its template cannot describe, e.g. a
+    tail that is not quite exponential -- scales with its brightness, and decays along its own
+    profile. A faint pulse near a bright one can therefore absorb that misfit at a separation
+    where two pulses of similar brightness would be genuinely resolved: on an exponential tail
+    the bright pulse's misfit falls below the faint pulse's level only after ~tau ln(S_bright /
+    S_faint). The required separation of each pair therefore grows with the log of their
+    brightness ratio, and stays x_min for pulses of similar brightness:
+
+        x_min_jk = x_min * (1 + c_ratio * min( ln(S_bright / S_faint), max_log_ratio ))
+
     THE PRIOR
     For every pair j < k (no time ordering is assumed):
 
-        x_jk     = |centre_j - centre_k| / (width_j + width_k)              separation in units of width
-        wall_jk  = softplus((x_min - x_jk) / w) / softplus(x_min / w)       1 at full overlap, ~0 for x > x_min
-        on_j     = sigmoid((snr_j - snr_on) / w_snr)                        ~1 for an active pulse, ~0 for an idle one
+        x_jk     = |centre_j - centre_k| / (width_j + width_k)                separation in units of width
+        wall_jk  = softplus((x_min_jk - x_jk) / w) / softplus(x_min_jk / w)   1 at full overlap, ~0 for x > x_min_jk
+        on_j     = sigmoid((snr_j - snr_on) / w_snr)                          ~1 for an active pulse, ~0 for an idle one
 
         log prior = -K * sum_{j<k} on_j on_k wall_jk
 
@@ -685,19 +699,28 @@ def repulsive_toa_prior(t, sigma, tau, snr, x_min=1.0, w=0.05, K=1000.0, snr_on=
             bottom of the band would be stricter. Zeros give separation by the Gaussians alone.
     snr:    each pulse's optimal SNR at its current amplitude (A_snr, or computed from templates
             that carry the fluence)
-    x_min:  minimum separation, in units of width_j + width_k. Without scattering, x = 1 is where
-            two equal Gaussians are just resolved (their sum stops being single-peaked). With
-            scattering it is the same criterion applied to the profiles' mean and spread, which
-            is approximate for strongly skewed profiles (tau >> sigma), whose peak sits well
-            before their mean.
+    x_min:  minimum separation for pulses of similar brightness, in units of width_j + width_k.
+            Without scattering, x = 1 is where two equal Gaussians are just resolved (their sum
+            stops being single-peaked). With scattering it is the same criterion applied to the
+            profiles' mean and spread, which is approximate for strongly skewed profiles
+            (tau >> sigma), whose peak sits well before their mean.
     w:      softness of the wall, in units of x. With w = 0.05 the cost has fallen to ~1 nat by
-            x = 1.2 (with K = 1000); a larger w leaks further past x_min.
+            x = 1.2 x_min_jk (with K = 1000); a larger w leaks further past x_min_jk.
     K:      depth of the wall at full overlap. It must exceed the log-likelihood an overlap could
             buy, or the data win: for the test burst, splitting the 5.5 ms component bought ~300.
+            Below x_min_jk the wall is ~(x_min_jk - x) / x_min_jk, so a pulse of SNR S, which
+            can buy ~S^2 / 2, is held out where K (x_min_jk - x) / x_min_jk > S^2 / 2.
     snr_on, w_snr: where a pulse counts as active, and how sharply. With the defaults an idle
-            pulse (snr ~ 0) has on = sigmoid(-12) ~ 6e-6, so passing through an active pulse
-            costs ~K * 6e-6 ~ 0.006 nats, while an overlapping pulse is held below snr ~ 1.5,
+            pulse (snr ~ 0) has on = sigmoid(-9) ~ 1e-4, so passing through an active pulse
+            costs ~K * 1e-4 ~ 0.1 nats, while an overlapping pulse is held below snr ~ 1.5,
             where it can absorb at most ~snr^2/2 ~ 1 nat.
+    c_ratio: how fast the required separation grows with the brightness ratio. 0 recovers a
+            single x_min for every pair. With the default 0.25 and x_min = 1: x_min_jk = 1.17
+            for a ratio of 2, 1.27 for 3, 1.40 for 5, 1.70 for 17 (e.g. A_snr 200 and 12).
+    max_log_ratio: cap on ln(S_bright / S_faint). A pulse switching off has S -> 0, which would
+            send the required separation to infinity just as the pulse passes through the
+            activity gate; the cap keeps the wall bounded there. The default 4 (a ratio of ~55)
+            caps x_min_jk at 2 x_min with c_ratio = 0.25.
 
     Returns (log prior, x) with x of shape (n_pulses * (n_pulses - 1) / 2,), in the pair order
     of jnp.triu_indices(n_pulses, k=1): (0,1), (0,2), ..., (1,2), ...
@@ -706,7 +729,14 @@ def repulsive_toa_prior(t, sigma, tau, snr, x_min=1.0, w=0.05, K=1000.0, snr_on=
     centre = t + tau                              # mean of each scattered profile
     width = jnp.sqrt(sigma ** 2 + tau ** 2)       # its standard deviation
     x = jnp.abs(centre[j] - centre[k]) / (width[j] + width[k])
-    wall = jax.nn.softplus((x_min - x) / w) / jax.nn.softplus(x_min / w)
+
+    # Required separation of each pair, growing with the log of their brightness ratio. The floor
+    # keeps the log finite for a pulse at zero amplitude; the cap keeps the wall bounded there.
+    s = jnp.maximum(snr, 1e-3)
+    log_ratio = jnp.minimum(jnp.abs(jnp.log(s[j]) - jnp.log(s[k])), max_log_ratio)
+    x_min_jk = x_min * (1.0 + c_ratio * log_ratio)
+
+    wall = jax.nn.softplus((x_min_jk - x) / w) / jax.nn.softplus(x_min_jk / w)
     on = jax.nn.sigmoid((snr - snr_on) / w_snr)
     return -K * jnp.sum(on[j] * on[k] * wall), x
 
@@ -936,6 +966,7 @@ def FD_gaussianlikelihood(
     spectral_coeff_map: dict = None,
     ordered_times: bool = True, # Strict time ordering prior on pulses
     repulsion: dict | None = {},      # {} = on, with repulsive_toa_prior's defaults; None = off
+    wraparound_ratio_lowFourierbins: bool = False,        # record the wraparound ratio; False skips it (unless containment_FD needs it)
 ):
     """
     Fourier-domain Gaussian likelihood with fluences sampled directly (not marginalized),
@@ -1011,9 +1042,10 @@ def FD_gaussianlikelihood(
 
     # TO REMOVE BLOCK ABOVE
 
-    # Recorded every run; penalized only if containment_FD is given
-    wraparound_ratio(params_stacked, single_pulse_fn, wraparound_amplitudes,
-                     inv_noise_var, containment_FD)
+    # Recorded unless switched off; always computed when containment_FD penalizes it
+    if wraparound_ratio_lowFourierbins or containment_FD is not None:
+        wraparound_ratio(params_stacked, single_pulse_fn, wraparound_amplitudes,
+                         inv_noise_var, containment_FD)
 
     residual = data_fd - model_fd
     numpyro.factor("log_likelihood", -0.5 * jnp.sum(jnp.abs(residual) ** 2 * inv_noise_var))

@@ -11,10 +11,23 @@ inputs must stay small to prevent rounding away tiny time delays:
 3. SED: The SED functions return ln F, not F. F = exp(ln F) overflows float32 once ln F > 88,
    and the SNR, which squares F, once ln F > 44, both of which wide spectral priors reach.
    single_pulse_model therefore only ever exponentiates normalized or combined logs.
+
+NOTE ON WRAPAROUND (setup_model's model_duration_pad):
+The data are a segment cut from a longer recording, so emission past either end of the window is
+simply missing (truncated). The analytic template sampled at the data's bin frequencies k / W is
+instead the Fourier transform of the pulse repeated with period W, so emission past the end
+reappears at the start (wrapped). With model_duration_pad > 0 the template is evaluated on a
+longer window W' = W + pad, transformed to time, cut to [0, W) exactly as the data were, and
+transformed back onto the data's retained bins: the model is then truncated like the data, and
+does not wrap, as long as the padding holds all emission outside [0, W). The usual way to get
+it is single_pulse_fn.extend_model_duration(priors), which returns the same model padded for
+those priors.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Callable
+import numpy as np
 import jax.numpy as jnp
 
 
@@ -234,7 +247,23 @@ def scattered_gaussian_fd_pulse(params_dict: dict, grid: FDGrid, constants: Mode
     return T
 
 # -------------------------------------------------------------------
-# 4. Main Model Orchestrator
+# 4. Padding against wraparound: FFT length
+# -------------------------------------------------------------------
+
+def _fft_friendly(n):
+    """Smallest n' >= n whose only prime factors are 2, 3 and 5, so the FFTs stay fast."""
+    while True:
+        m = n
+        for p in (2, 3, 5):
+            while m % p == 0:
+                m //= p
+        if m == 1:
+            return n
+        n += 1
+
+
+# -------------------------------------------------------------------
+# 5. Main Model Orchestrator
 # -------------------------------------------------------------------
 
 def setup_model(
@@ -244,6 +273,7 @@ def setup_model(
     sed_fn: Callable = running_power_law_log_sed,
     pulse_fn: Callable = scattered_gaussian_fd_pulse,
     fourier_freqs=None,
+    model_duration_pad: float = 0.0,
     _wraparoundFDdiagnostic: bool = True,
 ):
     """
@@ -253,9 +283,25 @@ def setup_model(
     freqs_channels: array of frequency channels in the data
     times: array of time bins in the data
     sed_fn: returns ln F (see Section 2), not F
+    fourier_freqs: the Fourier bins the data occupies, from data.py; None uses the full rfft grid
+    model_duration_pad: padding (s) against wraparound; 0 (default) keeps the original, wrapped
+        model. With model_duration_pad > 0 the template is evaluated on every rfft bin of a window
+        longer by at least model_duration_pad (rounded up to an FFT-friendly length), transformed
+        to time, cut to the data window, and transformed back onto `fourier_freqs` (see the module
+        note on wraparound). It is then truncated exactly like the data, as long as the padding
+        holds all emission the priors allow outside the window. Rather than setting it here,
+        build the model unpadded and call `.extend_model_duration(priors)` on it once the
+        priors exist (they need a model first, for the dispersion bounds), which returns the
+        same model padded for them.
+        The returned templates have the same shape either way, so nothing downstream changes;
+        the cost is evaluating the model on more bins plus one inverse and one forward FFT per
+        pulse and channel.
     _wraparoundFDdiagnostic: if True, also builds the same model on the two frequencies
-        [f1/2, f1], f1 = 1 / W_seg, and attaches it as `.low`. The likelihoods use it to
-        record the wraparound ratio. The inner call sets this False, so it does not recurse.
+        [f1/2, f1], f1 = 1 / W_seg, and attaches it as `.lowfreq_diagnostic`. The likelihoods use
+        it to record the wraparound ratio. The inner call sets this False, so it does not recurse.
+        With model_duration_pad > 0 the model no longer wraps, so the ratio is then only a measure
+        of the emission's extent relative to the window, and the containment_FD penalty is
+        unnecessary.
     """
     ### We are setting up constant values here
     constants = ModelConstants(**constants_dict)
@@ -264,6 +310,34 @@ def setup_model(
     if constants.DM_incoherent > 0 and bool(jnp.all(jnp.asarray(constants.channel_width) == 0)):
         raise ValueError("DM_incoherent > 0 but channel_width = 0: intra-channel smearing would be silently omitted.")
     grid = build_fd_grid(freqs_channels, times, constants, fourier_freqs)
+
+    # ---- Padding against wraparound: the longer grid the model is evaluated on ----
+    if model_duration_pad < 0:
+        raise ValueError(f"model_duration_pad must be >= 0; got {model_duration_pad}.")
+    eval_grid, n_long, truncate = grid, None, None
+    if model_duration_pad > 0:
+        t = np.asarray(times, dtype=np.float64).reshape(-1)
+        n_seg, dt = t.size, float(t[1] - t[0])
+        n_long = _fft_friendly(n_seg + int(math.ceil(model_duration_pad / dt)))
+        # Same start and spacing as the data, just longer; build_fd_grid then uses every rfft
+        # bin of it, DC included, since cutting in time mixes all frequencies
+        times_long = (t[0] + dt * np.arange(n_long)).astype(np.float32)
+        eval_grid = build_fd_grid(freqs_channels, times_long, constants, fourier_freqs=None)
+
+        # Where each of the data's retained bins sits on the segment's own rfft grid
+        f_data = np.asarray(grid.fourier_freqs, dtype=np.float64).reshape(-1)
+        bin_index = np.rint(f_data * n_seg * dt).astype(int)
+        if not np.allclose(bin_index, f_data * n_seg * dt, atol=1e-3):
+            raise ValueError("fourier_freqs are not bins of the segment's rfft grid (k / (N dt)).")
+        bin_index = jnp.asarray(bin_index)
+
+        def truncate(M_long):
+            # To time on the long window, where it is periodic only on W' and nothing wraps into
+            # [0, W); cut to the data window, as the data were cut; back onto the retained bins.
+            # The dt factors of the transform convention (X = dt rfft(x), x = irfft(X) / dt)
+            # cancel between the inverse and the forward transform, so they are left out.
+            x = jnp.fft.irfft(M_long, n=n_long, axis=-1)
+            return jnp.fft.rfft(x[..., :n_seg], axis=-1)[..., bin_index]
 
     def single_pulse_model(params_dict):
         """
@@ -283,17 +357,20 @@ def setup_model(
         free amplitude, so it cancels from the fit, and they convert the amplitude back to
         fluence with `log_sed_peak` below.
         """
-        lnF = sed_fn(params_dict, grid, constants)  # (nfreq, 1), the log of the SED
-        T = pulse_fn(params_dict, grid, constants)
+        lnF = sed_fn(params_dict, eval_grid, constants)  # (nfreq, 1), the log of the SED
+        T = pulse_fn(params_dict, eval_grid, constants)
 
         if "A" in params_dict:
             # A F = sign(A) exp(ln|A| + ln F): combined in log space, so a huge F times a small A
             # never overflows on the way to a moderate product. The sign is carried separately so
             # a negative A (e.g. a rejected full-normal fluence draw being plotted) still evaluates.
             A = jnp.float32(params_dict["A"])
-            return jnp.sign(A) * jnp.exp(jnp.log(jnp.abs(A)) + lnF) * T
+            M = jnp.sign(A) * jnp.exp(jnp.log(jnp.abs(A)) + lnF) * T
+        else:
+            M = jnp.exp(lnF - jnp.max(lnF)) * T
 
-        return jnp.exp(lnF - jnp.max(lnF)) * T
+        # With padding: truncated to the data window like the data, on the data's retained bins
+        return M if truncate is None else truncate(M)
 
     def log_sed_peak(params_dict):
         """
@@ -306,10 +383,134 @@ def setup_model(
     # closure is always named single_pulse_model, which says nothing about its contents
     # constants and grid exposed for convenience
     single_pulse_model.constants = constants
-    single_pulse_model.grid = grid
+    single_pulse_model.grid = grid              # the data's grid, on which templates are returned
+    single_pulse_model.model_duration_pad = float(model_duration_pad)
+    t_seg = jnp.asarray(times, dtype=jnp.float32).reshape(-1)
+    single_pulse_model.segment_duration = t_seg.shape[0] * float(t_seg[1] - t_seg[0])   # W (s)
+    single_pulse_model.n_long = n_long          # samples in the padded window; None without padding
     single_pulse_model.sed_fn = sed_fn.__name__
     single_pulse_model.pulse_fn = pulse_fn.__name__
     single_pulse_model.log_sed_peak = log_sed_peak
+
+    def extend_model_duration(burst, priors, wrapped_snr=1.0, containment=None, n_tau=3.0,
+                              n_sigma=3.0, time_param="mean_arrival_time"):
+        """
+        Returns this same model, rebuilt with the smallest padding against wraparound (see the
+        module note on wraparound) for which no pulse the priors allow wraps detectably back
+        into the data window. Optional: leave the call out to fit the original, unpadded model.
+
+            single_pulse_fn = setup_model(...)
+            priors = set_priors(burst, single_pulse_fn, n_pulses, ...)
+            single_pulse_fn = single_pulse_fn.extend_model_duration(burst, priors)
+
+        HOW THE PADDING IS CHOSEN
+        Worst-case pulses are built from the prior bounds: arrival time at either end of its
+        prior, the widest Gaussian and longest scattering tail allowed, and the residual DM at
+        either bound (or zero), so that emission runs past whichever edge it can. Each is
+        compared, for a candidate padding, with the same pulse on a window long enough that
+        nothing wraps. The difference is the wrapped emission, measured as a fraction of the
+        pulse's noise-weighted power, with channels weighted by this burst's own SNR^2 per
+        channel (as data.estimate_channel_weights measures it), so long tails in channels with
+        little signal count for little. The padding chosen is the smallest for which
+            (wrapped fraction) x SNR^2  <=  wrapped_snr^2
+        for every worst-case pulse, SNR being this burst's total optimal SNR estimated from the
+        data: wrapped emission below that is buried in the noise. The search runs up to the
+        padding priors.model_duration_pad_for_priors gives with n_tau and n_sigma, which is
+        used, with a warning, if even that is not enough.
+
+        burst:       the ConditionedData of the fit, for the channel weights and the burst's SNR
+        priors:      the priors dictionary of the fit, as returned by run.set_priors
+        wrapped_snr: largest SNR the wrapped emission may have; 1 (default) keeps it at the
+                     noise level
+        containment: the `containment` settings, if sigma and tau are drawn jointly instead of
+                     being in priors; the worst cases are then the widest Gaussian with no tail
+                     and the longest tail with the narrowest Gaussian
+        n_tau, n_sigma: e-folds of the tail and widths of the Gaussian in the upper limit of the
+                     search; see priors.model_duration_pad_for_priors
+        time_param:  name of the arrival-time prior
+        """
+        # Imported here rather than at the top: priors.py does not import this module, so there
+        # is no cycle, and a model without padding never needs it
+        import warnings
+        from priors import model_duration_pad_for_priors
+
+        pad_max = model_duration_pad_for_priors(single_pulse_model, priors, containment=containment,
+                                                n_tau=n_tau, n_sigma=n_sigma, verbose=False)
+        n_seg = int(np.asarray(times).reshape(-1).shape[0])
+        W = single_pulse_model.segment_duration
+
+        # ---- SNR^2 per channel from the data: excess power over the noise expectation ----
+        d = np.asarray(burst.data_fd)
+        s = np.broadcast_to(np.asarray(burst.sigma_noise_fd), d.shape)
+        snr2_chan = np.maximum(np.sum(np.abs(d) ** 2 / s ** 2, axis=-1) - 2.0 * d.shape[-1], 0.0)
+        snr2 = max(float(snr2_chan.sum()), 1.0)
+        weights = snr2_chan / snr2 if snr2_chan.sum() > 0 else np.full(snr2_chan.shape, 1.0 / snr2_chan.size)
+        tolerance = wrapped_snr ** 2 / snr2           # largest wrapped fraction of the power
+
+        # ---- worst-case pulses from the prior bounds ----
+        def bound(name, side):
+            return float(getattr(priors[name], side))
+        DM_max = max(abs(bound("DM", "low")), abs(bound("DM", "high"))) if "DM" in priors else 0.0
+        if "sigma" in priors and "tau_ref" in priors:
+            widths = [(bound("sigma", "high"), bound("tau_ref", "high"))]
+        else:
+            nu = np.asarray(freqs_channels, dtype=float).reshape(-1)
+            bot_over_ref = nu.min() / float(constants.freq_channels_ref)
+            extent = float(containment["extent_max"])
+            n_s, n_t = float(containment.get("n_sigma", 3.0)), float(containment.get("n_tau", 5.0))
+            widths = [(extent / n_s, 0.0),
+                      (float(containment["sigma_min"]), extent / n_t * bot_over_ref ** (-constants.delta))]
+        flat_sed = dict(gamma=0.0, beta=0.0, c1=0.0, c2=0.0)        # ln F = 0: the shape alone
+        if "delta" in priors:
+            flat_sed["delta"] = bound("delta", "low")                 # steepest scattering law
+        pulses = [dict(flat_sed, mean_arrival_time=t, sigma=sig, tau_ref=tau, DM=dm)
+                  for t in (bound(time_param, "low"), bound(time_param, "high"))
+                  for sig, tau in widths for dm in (-DM_max, 0.0, DM_max)]
+
+        def build(pad):
+            return setup_model(constants_dict, freqs_channels, times, sed_fn, pulse_fn,
+                               fourier_freqs=fourier_freqs, model_duration_pad=pad,
+                               _wraparoundFDdiagnostic=False)
+
+        # Reference: a window long enough that nothing the priors allow wraps
+        reference = build(4.0 * pad_max + W)
+        refs = [np.asarray(reference(p)) for p in pulses]
+
+        def wrapped_fraction(pad):
+            fn = build(pad)
+            worst = 0.0
+            for p, ref in zip(pulses, refs):
+                per_channel = (np.sum(np.abs(np.asarray(fn(p)) - ref) ** 2, axis=-1)
+                               / np.maximum(np.sum(np.abs(ref) ** 2, axis=-1), np.finfo(float).tiny))
+                worst = max(worst, float(np.sum(weights * per_channel)))
+            return worst
+
+        # ---- smallest adequate padding: bisection on the FFT-friendly window lengths ----
+        dt = W / n_seg
+        lengths = sorted({_fft_friendly(n_seg + k) for k in range(1, int(math.ceil(pad_max / dt)) + 1)})
+        if wrapped_fraction(pad_max) > tolerance:
+            warnings.warn("even the padding from the prior bounds leaves wrapped emission above "
+                          f"wrapped_snr = {wrapped_snr}; using it anyway. Increase n_tau, or check "
+                          "the priors.")
+            pad = pad_max
+        else:
+            lo, hi = 0, len(lengths) - 1                   # lengths[hi] is known to be adequate
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if wrapped_fraction((lengths[mid] - n_seg) * dt) <= tolerance:
+                    hi = mid
+                else:
+                    lo = mid + 1
+            pad = (lengths[hi] - n_seg) * dt
+
+        extended = setup_model(constants_dict, freqs_channels, times, sed_fn, pulse_fn,
+                               fourier_freqs=fourier_freqs, model_duration_pad=pad,
+                               _wraparoundFDdiagnostic=_wraparoundFDdiagnostic)
+        print(f"extend_model_duration: extending the model duration by a factor of "
+              f"{extended.n_long / n_seg:.2f} given the priors")
+        return extended
+
+    single_pulse_model.extend_model_duration = extend_model_duration
 
     if _wraparoundFDdiagnostic:
         t = jnp.asarray(times, dtype=jnp.float32).reshape(-1)
