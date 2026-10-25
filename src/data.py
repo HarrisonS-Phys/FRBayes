@@ -56,6 +56,9 @@ class ConditionedData:
     event_id: str
     data_path: str
 
+    # --- for plotting: the native channels behind each block ---
+    freq_members: jnp.ndarray = None  # (nfreq, n_avg) native centres (MHz) of the good channels averaged into each block; None for bursts prepared before it was added
+
 def block_average_channels(power, freq, n_avg):
     """
     Averages consecutive blocks of n_avg channels.
@@ -280,7 +283,11 @@ def prepare_burst(path, event_id=None, n_avg=8, fd_downsample=4, toa=None, exclu
     power = power[::-1, :]
     native_dnu = float(jnp.median(jnp.abs(jnp.diff(freq))))
 
+    freq_native = freq  # the good native channels, kept so plots can place each block exactly
     power, freq, freq_span, n_dropped = block_average_channels(power, freq, n_avg)
+    # The native centres averaged into each block, in block order. Used only for plotting: a block
+    # that straddles discarded channels is drawn over its own members, with the gap left visible.
+    freq_members = jnp.asarray(freq_native[: power.shape[0] * n_avg], dtype=jnp.float32).reshape(power.shape[0], n_avg)
     if verbose:
         print(f"{power.shape[0] * n_avg + n_dropped} good channels -> {power.shape[0]} blocks of "
               f"{n_avg} ({n_dropped} dropped); block span median "
@@ -346,4 +353,5 @@ def prepare_burst(path, event_id=None, n_avg=8, fd_downsample=4, toa=None, exclu
         n_noise_bins=n_noise_bins,
         freq_span=freq_span,
         native_dnu=native_dnu,
+        freq_members=freq_members,
     )

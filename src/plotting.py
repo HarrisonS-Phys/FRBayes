@@ -33,6 +33,18 @@ BIN EXTENTS. Time samples are labeled at their start, as in the model, so sample
 [t_b, t_b + dt]; channels are labeled at their centres. Waterfalls are drawn over those extents,
 curves through the bins' centres, and histograms over the bins' edges, so all three line up.
 
+FLAGGED CHANNELS. The fit's channels are blocks of n_avg consecutive GOOD native channels (see
+data.block_average_channels), so a block next to a flagged region spans it, and its centre -- the
+mean of its members -- can fall inside the gap. When the burst carries the native centres of each
+block's members (burst.freq_members, from data.prepare_burst), the waterfalls and the marginals
+along the channels are drawn over the native channels each block was averaged from: a block that
+straddles a flagged region is drawn in pieces on either side of it, and the flagged native
+channels are left grey. Every value shown is still one of the fit's blocks -- nothing is drawn at
+native resolution except where each block sits -- and every block covers the same number of native
+channels, so the fit looks exactly as it did; only the frequency axis is now exact and the flagged
+regions are visible. Sums over channels (the profiles above the waterfalls) are taken over the
+blocks, as before. Without freq_members, each block is drawn as one band around its centre.
+
 THE MISSING DC BIN. The zero-frequency (DC) bin is not among the retained bins, so every channel's
 time series has zero mean. A channel with bright emission therefore sits below zero away from the
 burst: bright channels show as dark horizontal bands, and the profile's baseline is negative. Data
@@ -43,6 +55,8 @@ the window. The same reason makes a plain sum over time zero in every channel, s
 time-domain marginal along the channels (the fluence spectrum) is always computed with each
 channel's median removed.
 """
+
+from collections import namedtuple
 
 import numpy as np
 import jax
@@ -60,6 +74,12 @@ MODEL_PARAMS = ("mean_arrival_time", "sigma", "DM", "tau_ref", "c1", "c2", "gamm
 FREQ_UNITS = {"Hz": 1e6, "kHz": 1e3, "MHz": 1.0, "GHz": 1e-3}
 
 MARGINAL_STYLES = ("line", "hist")
+
+# Colour of the flagged channels in the waterfalls
+FLAGGED_COLOUR = "0.8"
+
+# How the fit's channels are laid out along the frequency axis; see _channel_layout
+_Channels = namedtuple("_Channels", "block edges centres label gaps")
 
 
 # -------------------------------------------------------------------
@@ -137,12 +157,72 @@ def _time_axis(burst):
     return t + 0.5 * burst.dt, np.append(t, t[-1] + burst.dt)
 
 
-def _channel_axis(burst, freq_unit):
-    """(centres, edges, axis label) of the frequency channels in `freq_unit`."""
+def _channel_layout(burst, freq_unit):
+    """
+    How the fit's channels are drawn along the frequency axis, in `freq_unit`.
+
+    With burst.freq_members -- the native centres (MHz) of the good channels averaged into each
+    block, shape (n_chan, n_avg) -- the native grid from the lowest member to the highest, with
+    spacing burst.native_dnu, is cut into segments of consecutive native channels that belong to
+    the same block, or to none. A block is then drawn over exactly the native channels it was
+    averaged from, in several pieces if it straddles a flagged region, and the flagged native
+    channels form segments of their own, drawn grey. Without freq_members, or if the members do
+    not sit on an even native grid, each block is one segment around its centre.
+
+    Returns a _Channels:
+        block    (n_seg,) the block drawn on each segment; -1 where no block is (flagged)
+        edges    (n_seg + 1,) segment edges in freq_unit
+        centres  (n_seg,) segment centres in freq_unit
+        label    the frequency-axis label
+        gaps     True if any segment is flagged
+    """
     if freq_unit not in FREQ_UNITS:
         raise ValueError(f"freq_unit must be one of {list(FREQ_UNITS)}; got {freq_unit!r}.")
-    centres = np.asarray(burst.freq_channels).reshape(-1) * FREQ_UNITS[freq_unit]
-    return centres, _edges_from_centres(centres), f"Frequency [{freq_unit}]"
+    scale, label = FREQ_UNITS[freq_unit], f"Frequency [{freq_unit}]"
+    n_chan = np.asarray(burst.freq_channels).size
+
+    members = getattr(burst, "freq_members", None)
+    if members is not None:
+        members = np.asarray(members, dtype=np.float64)
+        dnu = float(getattr(burst, "native_dnu", 0.0))
+        f0 = members.min()
+        idx = np.rint((members - f0) / dnu).astype(int) if dnu > 0 else None
+        if (idx is not None and members.ndim == 2 and members.shape[0] == n_chan
+                and np.allclose(members, f0 + dnu * idx, rtol=0.0, atol=0.25 * dnu)
+                and np.unique(idx).size == idx.size):
+            # The block each native channel was averaged into, -1 for flagged channels
+            block_of_row = np.full(int(idx.max()) + 1, -1)
+            block_of_row[idx.ravel()] = np.repeat(np.arange(n_chan), members.shape[1])
+            # Merge runs of consecutive native channels drawn with the same block (or with none)
+            starts = np.concatenate([[0], np.flatnonzero(np.diff(block_of_row)) + 1])
+            row_edges = f0 + dnu * (np.arange(block_of_row.size + 1) - 0.5)
+            edges = row_edges[np.append(starts, block_of_row.size)] * scale
+            block = block_of_row[starts]
+            return _Channels(block, edges, 0.5 * (edges[1:] + edges[:-1]), label, bool(np.any(block < 0)))
+        print("plotting: the native channels of the blocks are not on an even grid; drawing each "
+              "channel block as one band around its centre.")
+
+    centres = np.asarray(burst.freq_channels).reshape(-1) * scale
+    return _Channels(np.arange(n_chan), _edges_from_centres(centres), centres, label, False)
+
+
+def _on_channels(values, ch):
+    """Per-block values, shape (n_chan, ...), laid out on the drawn segments `ch`: each segment
+    takes the value of its block, and flagged segments are NaN."""
+    v = np.asarray(values, dtype=float)
+    out = v[np.maximum(ch.block, 0)]
+    out[ch.block < 0] = np.nan
+    return out
+
+
+def _draw_waterfall(ax, values, x_edges, ch, vmin, vmax):
+    """Waterfall of per-block `values`, shape (n_chan, n_x), over the x bins' edges and the
+    channel layout `ch`. Flagged channels are drawn in FLAGGED_COLOUR."""
+    cmap = plt.get_cmap("viridis").copy()
+    cmap.set_bad(FLAGGED_COLOUR)
+    Z = np.ma.masked_invalid(_on_channels(values, ch))
+    return ax.pcolormesh(x_edges, ch.edges, Z, shading="flat", cmap=cmap, vmin=vmin, vmax=vmax,
+                         rasterized=True)
 
 
 def _check_marginal(marginal):
@@ -158,11 +238,14 @@ def _draw_top(ax, values, centres, edges, marginal, **kw):
     return ax.plot(centres, values, **kw)[0]
 
 
-def _draw_side(ax, values, centres, edges, marginal, **kw):
-    """Marginal along the channels, to the right of a waterfall: as _draw_top, turned sideways."""
+def _draw_side(ax, values, ch, marginal, **kw):
+    """Marginal along the channels, to the right of a waterfall: per-block `values` laid out on
+    the channel layout `ch`, as a curve through the segments' centres or a step histogram over
+    their edges. Both break across flagged channels."""
+    v = _on_channels(values, ch)
     if marginal == "hist":
-        return ax.stairs(values, edges, orientation="horizontal", baseline=None, **kw)
-    return ax.plot(values, centres, **kw)[0]
+        return ax.stairs(v, ch.edges, orientation="horizontal", baseline=None, **kw)
+    return ax.plot(v, ch.centres, **kw)[0]
 
 
 def _format_side(ax):
@@ -172,9 +255,9 @@ def _format_side(ax):
     ax.tick_params(axis="x", labelsize=7)
 
 
-def _title(burst, title, n_chan):
+def _title(burst, title, n_chan, gaps=False):
     return (f"{title}  ({n_chan} channels x {burst.n_time} samples, "
-            f"dt = {burst.dt * 1e6:.1f} us)")
+            f"dt = {burst.dt * 1e6:.1f} us{'; grey: flagged' if gaps else ''})")
 
 
 def _noise(burst, shape):
@@ -230,7 +313,7 @@ def plot_burst_TD(burst, X_fd=None, title="Data", vlim=None, pct=(1.0, 99.0), re
     """
     Waterfall in TIME of Fourier-domain values on the burst's grid, with the frequency-summed
     profile above and the fluence spectrum (sum over time, each channel's median removed) to the
-    right.
+    right. Flagged channels are grey (see the module note).
 
     burst:      the ConditionedData whose grid is used, e.g. as returned by data.prepare_burst
     X_fd:       what to plot, shape (n_chan, n_fourier): a model, a residual, ... Default
@@ -258,19 +341,18 @@ def plot_burst_TD(burst, X_fd=None, title="Data", vlim=None, pct=(1.0, 99.0), re
         X_td = _subtract_median(X_td)
 
     t_c, t_e = _time_axis(burst)
-    f_c, f_e, f_label = _channel_axis(burst, freq_unit)
+    ch = _channel_layout(burst, freq_unit)
     vmin, vmax = vlim if vlim is not None else np.nanpercentile(X_td, pct)
 
     fig, ax_ts, ax_wf, ax_side = _single_layout()
     _draw_top(ax_ts, np.nansum(X_td, axis=0), t_c, t_e, marginal, color="k", lw=0.8)
-    ax_ts.set_title(_title(burst, title, X_td.shape[0]))
+    ax_ts.set_title(_title(burst, title, X_td.shape[0], ch.gaps))
 
-    ax_wf.imshow(X_td, aspect="auto", origin="lower", interpolation="nearest", cmap="viridis",
-                 vmin=vmin, vmax=vmax, extent=(t_e[0], t_e[-1], f_e[0], f_e[-1]))
+    _draw_waterfall(ax_wf, X_td, t_e, ch, vmin, vmax)
     ax_wf.set_xlabel("Time [s]")
-    ax_wf.set_ylabel(f_label)
+    ax_wf.set_ylabel(ch.label)
 
-    _draw_side(ax_side, spectrum, f_c, f_e, marginal, color="k", lw=0.8)
+    _draw_side(ax_side, spectrum, ch, marginal, color="k", lw=0.8)
     ax_side.axvline(0, color="gray", lw=0.6, ls="--")
     ax_side.set_xlabel("Fluence\n(median removed)")
     plt.show()
@@ -282,7 +364,7 @@ def plot_burst_FD(burst, X_fd=None, title="Data", vlim=None, pct=(1.0, 99.0), fr
     """
     The burst in FOURIER space, in units of the noise: the amplitude |X| / sigma_noise_fd of every
     channel and retained Fourier bin, which is what the likelihood weighs. Only the amplitude is
-    shown; the phase carries the arrival times.
+    shown; the phase carries the arrival times. Flagged channels are grey (see the module note).
 
     Above: the same for the frequency-summed series, |sum_c X_c| / sqrt(sum_c sigma_c^2), i.e. the
     Fourier transform of the profile shown by plot_burst_TD. Right: the RMS over Fourier bins of
@@ -311,20 +393,20 @@ def plot_burst_FD(burst, X_fd=None, title="Data", vlim=None, pct=(1.0, 99.0), fr
 
     k_c = np.asarray(burst.fourier_freqs).reshape(-1) / 1e3
     k_e = _edges_from_centres(k_c)
-    f_c, f_e, f_label = _channel_axis(burst, freq_unit)
+    ch = _channel_layout(burst, freq_unit)
     vmin, vmax = vlim if vlim is not None else np.nanpercentile(amp, pct)
 
     fig, ax_ts, ax_wf, ax_side = _single_layout()
     _draw_top(ax_ts, summed, k_c, k_e, marginal, color="k", lw=0.8)
     ax_ts.set_ylabel("|X| / noise")
-    ax_ts.set_title(_title(burst, title, X_fd.shape[0]))
+    ax_ts.set_title(_title(burst, title, X_fd.shape[0], ch.gaps))
 
-    # pcolormesh places each bin at its own Fourier frequency, even if the retained bins are uneven
-    ax_wf.pcolormesh(k_c, f_c, amp, shading="nearest", cmap="viridis", vmin=vmin, vmax=vmax)
+    # Each Fourier bin is drawn over its own edges, even if the retained bins are uneven
+    _draw_waterfall(ax_wf, amp, k_e, ch, vmin, vmax)
     ax_wf.set_xlabel("Fourier frequency [kHz]")
-    ax_wf.set_ylabel(f_label)
+    ax_wf.set_ylabel(ch.label)
 
-    _draw_side(ax_side, np.sqrt(np.nanmean(amp ** 2, axis=1)), f_c, f_e, marginal, color="k", lw=0.8)
+    _draw_side(ax_side, np.sqrt(np.nanmean(amp ** 2, axis=1)), ch, marginal, color="k", lw=0.8)
     ax_side.set_xlabel("RMS |X| / noise")
     plt.show()
     return fig
@@ -340,7 +422,7 @@ def plot_fit_TD(burst, M_FD, M_FD_pulses=None, title_model="Model", vlim=None, p
     Data, model and residual side by side in TIME: each a waterfall with the frequency-summed
     profile above and the fluence spectrum (sum over time, each channel's median removed) to the
     right. Data, model and residual share the colour limits and the axes, so they can be compared
-    directly.
+    directly. Flagged channels are grey (see the module note).
 
     burst:       the ConditionedData the fit used
     M_FD:        the model on the burst's Fourier grid, shape (n_chan, n_fourier), e.g. from
@@ -378,22 +460,20 @@ def plot_fit_TD(burst, M_FD, M_FD_pulses=None, title_model="Model", vlim=None, p
     resid_td = data_td - model_td
 
     t_c, t_e = _time_axis(burst)
-    f_c, f_e, f_label = _channel_axis(burst, freq_unit)
+    ch = _channel_layout(burst, freq_unit)
     vmin, vmax = vlim if vlim is not None else np.nanpercentile(data_td, pct)
-    imshow_kwargs = dict(aspect="auto", origin="lower", interpolation="nearest", cmap="viridis",
-                         vmin=vmin, vmax=vmax, extent=(t_e[0], t_e[-1], f_e[0], f_e[-1]))
 
     fig, panels, legend_cell = _triple_layout()
     titles = ("Data", title_model, "Residual")
     for (ax_ts, ax_wf, ax_side), X_td, spectrum, name in zip(panels, (data_td, model_td, resid_td), spectra, titles):
         _draw_top(ax_ts, np.nansum(X_td, axis=0), t_c, t_e, marginal, color="k", lw=0.8, label="sum")
         ax_ts.set_title(name)
-        ax_wf.imshow(X_td, **imshow_kwargs)
+        _draw_waterfall(ax_wf, X_td, t_e, ch, vmin, vmax)
         ax_wf.set_xlabel("Time [s]")
-        _draw_side(ax_side, spectrum, f_c, f_e, marginal, color="k", lw=0.8)
+        _draw_side(ax_side, spectrum, ch, marginal, color="k", lw=0.8)
         ax_side.axvline(0, color="gray", lw=0.6, ls="--")
         ax_side.set_xlabel("Fluence\n(median removed)")
-    panels[0][1].set_ylabel(f_label)
+    panels[0][1].set_ylabel(ch.label)
     panels[2][0].axhline(0, color="gray", lw=0.6, ls="--")
 
     if pulses_td is not None and pulses_td.shape[0] > 1:
@@ -404,7 +484,7 @@ def plot_fit_TD(burst, M_FD, M_FD_pulses=None, title_model="Model", vlim=None, p
         legend_cell.legend(*panels[1][0].get_legend_handles_labels(), loc="center", fontsize=7,
                            frameon=False)
 
-    fig.suptitle(_title(burst, "Fit", data_td.shape[0]), fontsize=10)
+    fig.suptitle(_title(burst, "Fit", data_td.shape[0], ch.gaps), fontsize=10)
     plt.show()
     return fig
 
@@ -416,7 +496,8 @@ def plot_fit_FD(burst, M_FD, title_model="Re(Model)", vlim=None, pct=(1.0, 99.0)
     divided by the noise, so all three are in units of sigma and the residual should look like
     unit-variance noise. Above each: the sum over channels. Right of each: the RMS over Fourier
     bins of each channel; for the residual it should sit at the noise level, 1 (dashed), in every
-    channel, and channels above it are where the model misses.
+    channel, and channels above it are where the model misses. Flagged channels are grey (see the
+    module note).
 
     burst:       the ConditionedData the fit used; its noise whitens all three
     M_FD:        the model on the burst's Fourier grid, shape (n_chan, n_fourier), e.g. from
@@ -444,7 +525,7 @@ def plot_fit_FD(burst, M_FD, title_model="Re(Model)", vlim=None, pct=(1.0, 99.0)
 
     k_c = np.asarray(burst.fourier_freqs).reshape(-1) / 1e3
     k_e = _edges_from_centres(k_c)
-    f_c, f_e, f_label = _channel_axis(burst, freq_unit)
+    ch = _channel_layout(burst, freq_unit)
     vmin, vmax = vlim if vlim is not None else np.nanpercentile(data_w, pct)
     vres = np.nanpercentile(np.abs(resid_w), 99.0)
     limits = ((vmin, vmax), (vmin, vmax), (-vres, vres))
@@ -454,15 +535,15 @@ def plot_fit_FD(burst, M_FD, title_model="Re(Model)", vlim=None, pct=(1.0, 99.0)
     for (ax_ts, ax_wf, ax_side), X, (lo, hi), name in zip(panels, (data_w, model_w, resid_w), limits, titles):
         _draw_top(ax_ts, np.nansum(X, axis=0), k_c, k_e, marginal, color="k", lw=0.8)
         ax_ts.set_title(name)
-        # pcolormesh places each bin at its own Fourier frequency, even if the retained bins are uneven
-        ax_wf.pcolormesh(k_c, f_c, X, shading="nearest", cmap="viridis", vmin=lo, vmax=hi)
+        # Each Fourier bin is drawn over its own edges, even if the retained bins are uneven
+        _draw_waterfall(ax_wf, X, k_e, ch, lo, hi)
         ax_wf.set_xlabel("Fourier frequency [kHz]")
-        _draw_side(ax_side, np.sqrt(np.nanmean(X ** 2, axis=1)), f_c, f_e, marginal, color="k", lw=0.8)
+        _draw_side(ax_side, np.sqrt(np.nanmean(X ** 2, axis=1)), ch, marginal, color="k", lw=0.8)
         ax_side.set_xlabel("RMS / noise")
-    panels[0][1].set_ylabel(f_label)
+    panels[0][1].set_ylabel(ch.label)
     panels[2][0].axhline(0, color="gray", lw=0.6, ls="--")
     panels[2][2].axvline(1.0, color="gray", lw=0.6, ls="--")
 
-    fig.suptitle(_title(burst, "Fit", data_fd.shape[0]), fontsize=10)
+    fig.suptitle(_title(burst, "Fit", data_fd.shape[0], ch.gaps), fontsize=10)
     plt.show()
     return fig

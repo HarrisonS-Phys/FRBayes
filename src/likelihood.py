@@ -643,7 +643,7 @@ def wraparound_ratio_posthoc(samples, fluences, single_pulse_fn, inv_noise_var,
 # -------------------------------------------------------------------
 
 def repulsive_toa_prior(t, sigma, tau, snr, x_min=1.0, w=0.05, K=1000.0, snr_on=3.0, w_snr=0.33,
-                        c_ratio=0.25, max_log_ratio=4.0):
+                        c_ratio=0.0, max_log_ratio=4.0, tau_factor = None, tau_scale=1.0):
     """
     Soft exclusion between pulses that are both active, so that no two can overlap to absorb
     misspecification together, while an idle pulse can still pass freely through an active one.
@@ -721,14 +721,25 @@ def repulsive_toa_prior(t, sigma, tau, snr, x_min=1.0, w=0.05, K=1000.0, snr_on=
             send the required separation to infinity just as the pulse passes through the
             activity gate; the cap keeps the wall bounded there. The default 4 (a ratio of ~55)
             caps x_min_jk at 2 x_min with c_ratio = 0.25.
+    tau_factor: per pulse, tau at the channels holding its SNR^2 divided by tau_ref (computed in the
+                likelihood); each pair uses the larger of its two. None gives tau_ref, as before.
+    tau_scale:  extra weight on the scattering tail in the widths, since the exponential tail is the
+                least trustworthy part of the model. 1 gives the plain standard deviation. With 1.5 a
+                pulse must clear about 3 tail lengths of its neighbour, where the tail has fallen to
+                about 5%. The Gaussian part is not scaled: x_min = 1 is where two Gaussians are just
+                resolved. 
 
     Returns (log prior, x) with x of shape (n_pulses * (n_pulses - 1) / 2,), in the pair order
     of jnp.triu_indices(n_pulses, k=1): (0,1), (0,2), ..., (1,2), ...
     """
     j, k = jnp.triu_indices(t.shape[0], k=1)
-    centre = t + tau                              # mean of each scattered profile
-    width = jnp.sqrt(sigma ** 2 + tau ** 2)       # its standard deviation
-    x = jnp.abs(centre[j] - centre[k]) / (width[j] + width[k])
+    # tail length in the channels of whichever pulse of the pair sits lower in the band (1 = tau_ref)
+    f = 1.0 if tau_factor is None else jnp.maximum(tau_factor[j], tau_factor[k])
+    tau_j, tau_k = tau[j] * f, tau[k] * f
+    # tails count tau_scale times their standard deviation; the Gaussian part keeps the resolution floor
+    width_j = jnp.sqrt(sigma[j] ** 2 + (tau_scale * tau_j) ** 2)
+    width_k = jnp.sqrt(sigma[k] ** 2 + (tau_scale * tau_k) ** 2)
+    x = jnp.abs((t[j] + tau_j) - (t[k] + tau_k)) / (width_j + width_k)
 
     # Required separation of each pair, growing with the log of their brightness ratio. The floor
     # keeps the log finite for a pulse at zero amplitude; the cap keeps the wall bounded there.
@@ -1033,9 +1044,18 @@ def FD_gaussianlikelihood(
 
     # Only active pulses repel; see repulsive_toa_prior. 'toa_separation' is x for every pair.
     if repulsion is not None and n_pulses > 1:
+        rep = dict(repulsion)
+        tau_factor = None
+        if rep.pop("band_tau", True):
+            # each pulse's channel weights, and tau at those channels relative to tau_ref
+            power_chan = jnp.sum(jnp.abs(templates) ** 2 * inv_noise_var[None], axis=-1)       # (n_pulses, n_chan)
+            w_chan = power_chan / jnp.sum(power_chan, axis=-1, keepdims=True)
+            nu_over_ref = jnp.asarray(single_pulse_fn.grid.normalized_freqs_channels).reshape(-1)
+            delta = jnp.reshape(params_stacked.get("delta", -4.0), (-1, 1))
+            tau_factor = jnp.sum(w_chan * nu_over_ref[None, :] ** delta, axis=-1)                # (n_pulses,)
         log_prior, separation = repulsive_toa_prior(
             params_stacked[time_param], params_stacked["sigma"], params_stacked["tau_ref"],
-            pulse_snr, **repulsion
+            pulse_snr, tau_factor=tau_factor, **rep
         )
         numpyro.deterministic("toa_separation", separation)
         numpyro.factor("repulsive_toa_prior", log_prior)
