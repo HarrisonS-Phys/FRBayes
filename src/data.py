@@ -87,9 +87,11 @@ def block_average_channels(power, freq, n_avg):
         n_dropped,
     )
 
-def estimate_noise(data_td, dt, toa=None, exclude_fraction=0.2, noise_fraction=0.2, verbose=True):
+def estimate_noise(data_td, dt, toa=None, exclude_fraction=0.2, noise_fraction=0.2, clip=7.0,
+                   verbose=True):
     """
-    Off-pulse median and MAD estimate of the noise per channel, in the time domain.
+    Off-pulse median and clipped standard deviation of the noise per channel, in the time domain.
+    The median is the baseline subtracted for display; the standard deviation is the noise level.
 
     Only bins BEFORE the burst should be used. The scattering tail extends after the arrival time and
     is far longer than the intrinsic width, especially at the bottom of the band, so trailing
@@ -105,6 +107,22 @@ def estimate_noise(data_td, dt, toa=None, exclude_fraction=0.2, noise_fraction=0
                       safe when the burst is known to arrive later than that: a burst inside the
                       window inflates the noise estimate severalfold, which silently rescales
                       the likelihood, the channel weights and the meaning of s_opt.
+    clip:             samples further than clip standard deviations from the channel's median are
+                      left out of its standard deviation, so an RFI spike in the window cannot
+                      inflate it. 7 leaves Gaussian noise untouched and removes under 0.1% of
+                      even the most skewed intensity noise (chi^2 with 2 degrees of freedom,
+                      biasing it low by ~2%), while catching any spike that matters. None keeps
+                      every sample.
+
+    WHY A STANDARD DEVIATION AND NOT THE MAD. The likelihood works with Fourier bins, each a sum
+    over all N samples of a channel, so by the central limit theorem they are Gaussian with a
+    variance set by the TRUE variance of the time samples, whatever the shape of their
+    distribution. Intensity samples are skewed (sums of squared voltages, chi^2-like with few
+    degrees of freedom), and for skewed noise 1.4826 x MAD -- exact only for Gaussian noise --
+    falls short of the standard deviation: by 4% for 16 degrees of freedom, 8% for 8, 17% for 4
+    and 40% for 2. That would make sigma_noise_fd too small, the posteriors too narrow and every
+    log-likelihood difference too large. The off-pulse window is chosen to be free of the burst,
+    so the MAD's robustness bought little; the clipping keeps it against isolated outliers.
 
     The estimate is always attempted, however few bins are available, and the count is returned
     so a caller can decide whether it is enough.
@@ -129,16 +147,32 @@ def estimate_noise(data_td, dt, toa=None, exclude_fraction=0.2, noise_fraction=0
     off_pulse = data_td[:, :n_noise_bins]
 
     median_noise_td = jnp.median(off_pulse, axis=1, keepdims=True)
-    mad = jnp.median(jnp.abs(off_pulse - median_noise_td), axis=1, keepdims=True)
+    deviation = off_pulse - median_noise_td
 
-    # 1.4826 = 1 / Phi^-1(3/4), converting the median absolute deviation to a standard deviation
-    # for Gaussian noise. MAD is used rather than the sample std so that an unremoved spike or a
-    # sliver of burst in the window cannot inflate the estimate.
-    sigma_noise_td = mad * 1.4826
+    # Standard deviation of each channel, iteratively leaving out samples beyond `clip` of it. The
+    # first pass clips at the (robust, but for skewed noise too small) MAD-based scale only to
+    # get started; later passes use the clipped standard deviation itself, so for clean noise
+    # every sample ends up included. See the docstring for why the standard deviation is used.
+    sigma_noise_td = 1.4826 * jnp.median(jnp.abs(deviation), axis=1, keepdims=True)
+    keep = jnp.ones_like(deviation, dtype=bool)
+    if clip is not None:
+        for _ in range(5):
+            keep = jnp.abs(deviation) <= clip * sigma_noise_td
+            n_keep = jnp.maximum(jnp.sum(keep, axis=1, keepdims=True), 2)
+            mean_keep = jnp.sum(jnp.where(keep, off_pulse, 0.0), axis=1, keepdims=True) / n_keep
+            sigma_noise_td = jnp.sqrt(jnp.sum(jnp.where(keep, (off_pulse - mean_keep) ** 2, 0.0),
+                                              axis=1, keepdims=True) / (n_keep - 1))
+    else:
+        sigma_noise_td = jnp.std(off_pulse, axis=1, keepdims=True, ddof=1)
+    if verbose and clip is not None:
+        n_clipped = int(jnp.sum(~keep))
+        if n_clipped:
+            print(f"  {n_clipped} of {keep.size} off-pulse samples beyond {clip:g} sigma left out of "
+                  f"the noise estimate")
 
     # Bad channels are assumed already discarded, so every channel should yield a usable noise
     # estimate. A non-positive or non-finite value means something upstream is wrong -- a dead
-    # channel left in the file, or a noise window so short that the MAD collapses to zero -- and
+    # channel left in the file, or a noise window so short that the spread collapses to zero -- and
     # it would otherwise propagate silently as an infinite sigma and NaN channel weights.
     bad = ~(jnp.isfinite(sigma_noise_td) & (sigma_noise_td > 0))
     if bool(jnp.any(bad)):
@@ -252,7 +286,7 @@ def orthogonal_spectral_basis(freq, weights, freq_ref):
 
 
 def prepare_burst(path, event_id=None, n_avg=8, fd_downsample=4, toa=None, exclude_fraction=0.2,
-                  noise_fraction=0.2, verbose=True):
+                  noise_fraction=0.2, noise_clip=7.0, verbose=True):
     """
     Loads a dedispersed burst and conditions it for the Fourier-domain model.
 
@@ -272,6 +306,8 @@ def prepare_burst(path, event_id=None, n_avg=8, fd_downsample=4, toa=None, exclu
     exclude_fraction: fraction of the pre-TOA lead-in, nearest the TOA, discarded from the
                     noise estimate
     noise_fraction: fraction of the segment used for the noise estimate when toa is None
+    noise_clip:     off-pulse samples beyond this many standard deviations are left out of the
+                    noise estimate; see `estimate_noise`
 
     Returns a ConditionedData.
     """
@@ -302,7 +338,8 @@ def prepare_burst(path, event_id=None, n_avg=8, fd_downsample=4, toa=None, exclu
     dt = float(times[1] - times[0])
 
     median_noise_td, sigma_noise_td, n_noise_bins = estimate_noise(
-        data_td, dt, toa, exclude_fraction, noise_fraction, verbose
+        data_td, dt, toa=toa, exclude_fraction=exclude_fraction, noise_fraction=noise_fraction,
+        clip=noise_clip, verbose=verbose,
     )
     # For display only: puts each channel's off-pulse level at zero in the stored data_td. It has
     # no effect on the fit, since subtracting a constant from a channel changes only its DC bin,

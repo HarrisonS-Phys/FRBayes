@@ -72,6 +72,7 @@ def set_priors(
     gamma_range=(-10.0, 200.0),
     beta_range=(-200.0, 10.0),
     verbose: bool = True,
+    shrink_sigma_npulses: bool = False,
     **overrides,
 ) -> Dict[str, dist.Distribution]:
     """
@@ -82,7 +83,7 @@ def set_priors(
         mean_arrival_time  Uniform over the segment
         DM                 Uniform(-D_max, D_max), from dispersion_prior_bounds
         sigma, tau_ref     Uniform, from width_prior_bounds at `toa`; the upper bound on sigma
-                           is divided by n_pulses
+                           is divided by n_pulses if shrink_sigma_npulses
         c1, c2             Uniform, from spectral_coeff_bounds mapping the (gamma, beta) box
         A_snr              HalfNormal(s_opt), only if s_opt is given
 
@@ -92,7 +93,10 @@ def set_priors(
                  the model closure from model.setup_model. Used for the DM bounds, and to check
                  that the spectral parameters match its SED.
     n_pulses:    number of pulses the fit will use; must be the same n_pulses passed to run_fit.
-                 Each pulse gets 1/n_pulses of the single-pulse upper bound on sigma.
+    shrink_sigma_npulses:
+                 give each pulse 1/n_pulses of the single-pulse upper bound on sigma. Default
+                 False: every pulse gets the single-pulse bound, so fits with different numbers of
+                 pulses share the same per-pulse prior and are nested.
     toa:         arrival time the width bounds are computed for (s, relative to the segment
                  start). Defaults to the middle of the segment, which gives the widest bound on
                  sigma. The bounds assume the pulse sits there: a draw near the edge of the
@@ -122,7 +126,7 @@ def set_priors(
     dm = dispersion_prior_bounds(burst, single_pulse_fn)
 
     # Each of n pulses gets 1/n of the single-pulse upper bound on sigma
-    sigma_max = width["sigma_max"] / n_pulses
+    sigma_max = width["sigma_max"] / (n_pulses if shrink_sigma_npulses else 1)
     if sigma_max <= width["sigma_min"]:
         raise ValueError(f"sigma upper bound / n_pulses = {sigma_max:.3g} s is below the lower bound "
                          f"{width['sigma_min']:.3g} s: too many pulses for this segment.")

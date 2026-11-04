@@ -392,8 +392,8 @@ def setup_model(
     single_pulse_model.pulse_fn = pulse_fn.__name__
     single_pulse_model.log_sed_peak = log_sed_peak
 
-    def extend_model_duration(burst, priors, wrapped_snr=1.0, containment=None, n_tau=3.0,
-                              n_sigma=3.0, time_param="mean_arrival_time"):
+    def extend_model_duration(burst=None, priors=None, wrapped_snr=1.0, containment=None, n_tau=3.0,
+                              n_sigma=3.0, time_param="mean_arrival_time", factor=None):
         """
         Returns this same model, rebuilt with the smallest padding against wraparound (see the
         module note on wraparound) for which no pulse the priors allow wraps detectably back
@@ -402,6 +402,10 @@ def setup_model(
             single_pulse_fn = setup_model(...)
             priors = set_priors(burst, single_pulse_fn, n_pulses, ...)
             single_pulse_fn = single_pulse_fn.extend_model_duration(burst, priors)
+
+        or, with a fixed extension instead of the search below,
+
+            single_pulse_fn = single_pulse_fn.extend_model_duration(factor=2)
 
         HOW THE PADDING IS CHOSEN
         Worst-case pulses are built from the prior bounds: arrival time at either end of its
@@ -428,7 +432,28 @@ def setup_model(
         n_tau, n_sigma: e-folds of the tail and widths of the Gaussian in the upper limit of the
                      search; see priors.model_duration_pad_for_priors
         time_param:  name of the arrival-time prior
+        factor:      if given, skips the search and extends the model duration to `factor` times the
+                     segment, rounded up to an FFT-friendly length (e.g. 2 for twice the segment).
+                     burst, priors and the settings above are then not used. Must be > 1. Nothing
+                     checks that the padding is enough, so use it when the extent of the emission
+                     is known, e.g. from a first fit.
         """
+        if factor is not None:
+            factor = float(factor)
+            if factor <= 1.0:
+                raise ValueError(f"factor is the extended duration over the segment's and must be > 1; "
+                                 f"got {factor}.")
+            extended = setup_model(constants_dict, freqs_channels, times, sed_fn, pulse_fn,
+                                   fourier_freqs=fourier_freqs,
+                                   model_duration_pad=(factor - 1.0) * single_pulse_model.segment_duration,
+                                   _wraparoundFDdiagnostic=_wraparoundFDdiagnostic)
+            n_seg = int(np.asarray(times).reshape(-1).shape[0])
+            print(f"extend_model_duration: extending the model duration by a factor of "
+                  f"{extended.n_long / n_seg:.2f} (requested {factor:g})")
+            return extended
+        if burst is None or priors is None:
+            raise ValueError("extend_model_duration needs burst and priors, or a fixed factor.")
+
         # Imported here rather than at the top: priors.py does not import this module, so there
         # is no cycle, and a model without padding never needs it
         import warnings

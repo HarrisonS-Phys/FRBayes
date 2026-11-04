@@ -9,6 +9,11 @@ spectrum) above it, and a marginal along the frequency channels to its right.
     plot_burst_TD(burst)                                    data, in time
     plot_burst_TD(burst, M_FD, title="Model")               model, in time
     plot_burst_FD(burst, burst.data_fd - M_FD, "Residual")  residual, in Fourier space
+    plot_noise_window(burst)                                the window the noise was estimated from
+    plot_hdi_mask(burst, M_FD=M_FD, single_pulse_fn=fn, params=params, hdi_mass=0.95)
+                                                            what postprocess.residual_test blocks out
+    plot_residual_tiles(burst, M_FD, result)                boxes found by excess_power_search
+    plot_boxes_explained(burst, M_old, M_new, check)        whether a new pulse explains them
 
 Fits are shown as data | model | residual side by side:
 
@@ -119,7 +124,9 @@ def model_from_draw(single_pulse_fn, samples, draw_idx):
         raise KeyError("samples has no 'A'. For a marginalized fit, add the fluences drawn by "
                        "posthoc_samples first, flattened to (n_draws, n_pulses).")
     n_pulses = np.shape(samples["mean_arrival_time"])[-1]
-    params = {k: jnp.asarray(samples[k][draw_idx]).reshape(n_pulses) for k in MODEL_PARAMS if k in samples}
+    # A parameter stored once per draw rather than per pulse is given to every pulse
+    params = {k: jnp.broadcast_to(jnp.asarray(samples[k][draw_idx]).reshape(-1), (n_pulses,))
+              for k in MODEL_PARAMS if k in samples}
     M_FD_pulses = jax.vmap(single_pulse_fn)(params)
     return jnp.sum(M_FD_pulses, axis=0), M_FD_pulses
 
@@ -241,10 +248,12 @@ def _draw_top(ax, values, centres, edges, marginal, **kw):
 def _draw_side(ax, values, ch, marginal, **kw):
     """Marginal along the channels, to the right of a waterfall: per-block `values` laid out on
     the channel layout `ch`, as a curve through the segments' centres or a step histogram over
-    their edges. Both break across flagged channels."""
+    their edges. Both break across flagged channels. The histogram is closed down to zero, so a
+    block isolated between two flagged channels still reads as a bar rather than a lone vertical
+    stroke."""
     v = _on_channels(values, ch)
     if marginal == "hist":
-        return ax.stairs(v, ch.edges, orientation="horizontal", baseline=None, **kw)
+        return ax.stairs(v, ch.edges, orientation="horizontal", baseline=0.0, **kw)
     return ax.plot(v, ch.centres, **kw)[0]
 
 
@@ -412,6 +421,81 @@ def plot_burst_FD(burst, X_fd=None, title="Data", vlim=None, pct=(1.0, 99.0), fr
     return fig
 
 
+def plot_noise_window(burst, vlim=(-3.0, 3.0), freq_unit="MHz", marginal="hist", tail_fraction=0.2):
+    """
+    The data in units of each channel's noise estimate, with the off-pulse window the estimate
+    came from marked, to check that the window holds no burst emission and that the noise level
+    holds across the segment.
+
+    Uses burst.data_td, the time-domain data at full time resolution that data.estimate_noise
+    worked on (before the Fourier truncation), divided by burst.sigma_noise_td per channel. The
+    window is its first burst.n_noise_bins samples.
+
+    Above: the SNR-weighted profile, sum_c sqrt(w_c) z_c(t) with w the channel weights. For white
+    noise of the estimated level it has unit variance in every sample, so emission shows as a
+    run above zero, and a noise level that changes along the segment as a change in its spread.
+    The window is shaded, with +-3 dashed. Right: the mean of each channel over the window, in
+    units of the standard error of that mean; emission leaking into the window pushes channels
+    positive. The median subtracted in data.prepare_burst was taken over the same window, so even
+    for pure noise these scatter about zero with a spread of ~0.75 rather than 1.
+
+    burst:         the ConditionedData, e.g. as returned by data.prepare_burst
+    vlim:          colour limits of the waterfall, in units of the noise (default +-3)
+    freq_unit:     unit of the frequency-channel axis, "MHz" (default), "GHz", "kHz" or "Hz"
+    marginal:      "hist" (default) for the raw value of every bin as a step histogram, "line" for
+                   curves
+    tail_fraction: the last fraction of the segment, used as a second off-pulse window for the
+                   printed comparison. It may still hold the scattering tail; check the plot.
+
+    Prints the profile's mean over the last third of the window (in units of its standard error;
+    clearly positive means emission reaches into the window) and the profile's standard deviation
+    in the window and at the end of the segment (1 if the noise estimate holds; larger at the end
+    means the noise is underestimated there, or the tail reaches it).
+    Returns the figure.
+    """
+    _check_marginal(marginal)
+    n_win = int(burst.n_noise_bins)
+    z = np.asarray(burst.data_td) / np.asarray(burst.sigma_noise_td).reshape(-1, 1)
+    w = np.asarray(burst.channel_weights, dtype=float).reshape(-1)
+    profile = np.tensordot(np.sqrt(w / w.sum()), z, axes=(0, 0))          # unit variance for white noise
+
+    t_c, t_e = _time_axis(burst)
+    ch = _channel_layout(burst, freq_unit)
+    win_end = t_e[n_win]
+    window_mean = z[:, :n_win].mean(axis=1) * np.sqrt(n_win)              # per channel, standard errors
+
+    last = profile[n_win - max(n_win // 3, 1):n_win]
+    n_tail = max(int(tail_fraction * profile.size), 2)
+    print(f"noise window: first {n_win} of {profile.size} samples (to {win_end * 1e3:.2f} ms)")
+    print(f"  profile mean over the last third of the window: {last.mean() * np.sqrt(last.size):+.2f} "
+          f"standard errors (emission leaking in shows as clearly positive)")
+    print(f"  profile sd in the window: {profile[:n_win].std():.2f}   "
+          f"in the last {tail_fraction:.0%} of the segment: {profile[-n_tail:].std():.2f}   (expect 1)")
+
+    fig, ax_ts, ax_wf, ax_side = _single_layout()
+    _draw_top(ax_ts, profile, t_c, t_e, marginal, color="k", lw=0.8)
+    ax_ts.axvspan(t_e[0], win_end, color="tab:orange", alpha=0.2, lw=0, label="noise window")
+    for level in (-3.0, 3.0):
+        ax_ts.axhline(level, color="gray", lw=0.6, ls="--")
+    ax_ts.axhline(0.0, color="gray", lw=0.6)
+    ax_ts.set_ylabel("weighted\nprofile [noise]")
+    ax_ts.legend(loc="upper right", fontsize=7, frameon=False)
+    ax_ts.set_title(_title(burst, "Noise window", z.shape[0], ch.gaps))
+
+    _draw_waterfall(ax_wf, z, t_e, ch, vlim[0], vlim[1])
+    ax_wf.axvline(win_end, color="tab:orange", lw=1.2)
+    ax_wf.set_xlabel("Time [s]")
+    ax_wf.set_ylabel(ch.label)
+
+    _draw_side(ax_side, window_mean, ch, marginal, color="k", lw=0.8)
+    for level in (-3.0, 3.0):
+        ax_side.axvline(level, color="gray", lw=0.6, ls="--")
+    ax_side.axvline(0.0, color="gray", lw=0.6)
+    ax_side.set_xlabel("window mean\n[std. errors]")
+    plt.show()
+    return fig
+
+
 # -------------------------------------------------------------------
 # Fits: data | model | residual
 # -------------------------------------------------------------------
@@ -545,5 +629,220 @@ def plot_fit_FD(burst, M_FD, title_model="Re(Model)", vlim=None, pct=(1.0, 99.0)
     panels[2][2].axvline(1.0, color="gray", lw=0.6, ls="--")
 
     fig.suptitle(_title(burst, "Fit", data_fd.shape[0], ch.gaps), fontsize=10)
+    plt.show()
+    return fig
+
+
+def plot_hdi_mask(burst, mask=None, M_FD=None, single_pulse_fn=None, params=None, hdi_mass=None,
+                  active_snr=3.0, vlim=None, pct=(1.0, 99.0), rebaseline=True, freq_unit="MHz",
+                  colour="tab:red", alpha=0.35):
+    """
+    The data in TIME, and with M_FD also the residual, with the pixels that
+    postprocess.residual_test blocks out shaded: each fitted pulse's highest-density interval,
+    channel by channel. Use it to check that the blocked region covers each pulse, including its
+    tail at the bottom of the band, and nothing else.
+
+    burst:      the ConditionedData the fit used
+    mask:       boolean (n_chan, n_time), e.g. residual_test(...)["mask"]. Leave it out to build
+                it here from single_pulse_fn, params and hdi_mass instead.
+    M_FD:       optional, the model the mask was built for; adds a residual panel
+    single_pulse_fn, params, hdi_mass, active_snr:
+                used only when mask is not given: the model closure, one draw's per-pulse
+                parameters (postprocess.draw_params(...) or test_params), the probability mass of
+                each pulse's per-channel profile to block (default 0.95), and the A_snr below
+                which a pulse is not blocked; see postprocess.pulse_footprints. A mask passed in
+                was built with its own hdi_mass, so giving both raises an error.
+    vlim, pct:  colour limits of the waterfalls (shared), as in plot_burst_TD
+    rebaseline: subtract each channel's median over time (display only; see the module note)
+    freq_unit:  unit of the frequency-channel axis
+    colour, alpha: of the shading
+
+    Returns the figure.
+    """
+    from matplotlib.colors import ListedColormap
+
+    if mask is not None and hdi_mass is not None:
+        raise ValueError("a mask was passed, so hdi_mass would have no effect: the mask was built with "
+                         "its own hdi_mass. Leave out the mask (and pass single_pulse_fn and params), or "
+                         "rebuild it with residual_test(..., hdi_mass=...).")
+    if mask is None:
+        if single_pulse_fn is None or params is None:
+            raise ValueError("pass a mask, or single_pulse_fn and params to build one with hdi_mass.")
+        hdi_mass = 0.95 if hdi_mass is None else hdi_mass
+        from postprocess import pulse_footprints
+        mask = pulse_footprints(burst, single_pulse_fn, params, hdi_mass=hdi_mass, active_snr=active_snr)
+        label = f"{hdi_mass:.0%} HDIs"
+    else:
+        label = "HDIs"
+
+    data_td = np.asarray(to_time_domain(burst, jnp.asarray(burst.data_fd)))
+    panels = [("Data", data_td)]
+    if M_FD is not None:
+        panels.append(("Residual", data_td - np.asarray(to_time_domain(burst, jnp.asarray(M_FD)))))
+    if rebaseline:
+        _announce_rebaseline()
+        panels = [(name, _subtract_median(X)) for name, X in panels]
+
+    t_c, t_e = _time_axis(burst)
+    ch = _channel_layout(burst, freq_unit)
+    vmin, vmax = vlim if vlim is not None else np.nanpercentile(panels[0][1], pct)
+    shade = np.ma.masked_invalid(_on_channels(np.where(np.asarray(mask, bool), 1.0, np.nan), ch))
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(6.5 * len(panels), 5.5), sharey=True, squeeze=False)
+    for ax, (name, X) in zip(axes[0], panels):
+        _draw_waterfall(ax, X, t_e, ch, vmin, vmax)
+        ax.pcolormesh(t_e, ch.edges, shade, shading="flat", cmap=ListedColormap([colour]), alpha=alpha,
+                      rasterized=True)
+        ax.set_title(name)
+        ax.set_xlabel("Time [s]")
+    axes[0][0].set_ylabel(ch.label)
+    fig.suptitle(_title(burst, f"Blocked by the pulses' {label} ({float(np.mean(mask)):.0%} of pixels, shaded)",
+                        np.asarray(mask).shape[0], ch.gaps), fontsize=10)
+    fig.tight_layout()
+    plt.show()
+    return fig
+
+
+def _draw_box(ax, ch, box, label, colour, linestyle="-", linewidth=1.5):
+    """Outlines a box of postprocess.excess_power_search on a time waterfall: whole channels, from
+    the lower edge of its first to the upper edge of its last, over its time extent, plus the part
+    at the end of the segment for a box whose first time cell wraps there (t_wrap)."""
+    from matplotlib.patches import Rectangle
+
+    c0, c1 = box["channel_index"]
+    seg = np.flatnonzero((ch.block >= c0) & (ch.block < c1))
+    lo, hi = ch.edges[seg.min()], ch.edges[seg.max() + 1]
+    for t0, t1 in [box["t_range"]] + ([box["t_wrap"]] if box.get("t_wrap") else []):
+        ax.add_patch(Rectangle((t0, lo), t1 - t0, hi - lo, fill=False, edgecolor=colour,
+                               linewidth=linewidth, linestyle=linestyle))
+        ax.text(t0, hi, label, color=colour, fontsize=9, fontweight="bold", va="bottom", ha="left",
+                clip_on=True)
+
+
+def plot_residual_tiles(burst, M_FD, result, n_show=None, vlim=None, pct=(1.0, 99.0), rebaseline=True,
+                        freq_unit="MHz", colour="tab:red"):
+    """
+    The data and the residual in TIME, with the boxes postprocess.excess_power_search found
+    outlined: where the leftover signal that neither noise nor the tolerated model error explains
+    sits. Boxes are numbered by significance and listed, with their unexplained SNR, in the
+    corner of the residual panel. Solid outlines are boxes significant on their own after the
+    trials correction; dashed ones are not.
+
+    burst:     the ConditionedData the fit used
+    M_FD:      the model the search was run on
+    result:    the dict excess_power_search returned
+    n_show:    how many of the boxes in result['tiles'] to draw (default: all of them)
+    vlim, pct: colour limits of the waterfalls (shared), as in plot_burst_TD
+    rebaseline: subtract each channel's median over time (display only; see the module note)
+    freq_unit: unit of the frequency-channel axis
+    colour:    of the outlines
+
+    A box covers whole radio channels, so its frequency extent is drawn from the lower edge of its
+    first channel to the upper edge of its last. Its time extent is that of its time cells, whose
+    edges are blurred by about one cell (see excess_power_search); a box including the first time
+    cell, which straddles the start of the segment, is also drawn at the segment's end.
+
+    Returns the figure.
+    """
+    tiles = result["tiles"][:n_show]
+    log10_limit = np.log10(result["p_false_alarm"]) - np.log10(result["n_tiles"])
+
+    data_td = np.asarray(to_time_domain(burst, jnp.asarray(burst.data_fd)))
+    panels = [("Data", data_td),
+              ("Residual", data_td - np.asarray(to_time_domain(burst, jnp.asarray(M_FD))))]
+    if rebaseline:
+        _announce_rebaseline()
+        panels = [(name, _subtract_median(X)) for name, X in panels]
+
+    t_c, t_e = _time_axis(burst)
+    ch = _channel_layout(burst, freq_unit)
+    vmin, vmax = vlim if vlim is not None else np.nanpercentile(panels[0][1], pct)
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5), sharey=True, squeeze=False)
+    for ax, (name, X) in zip(axes[0], panels):
+        _draw_waterfall(ax, X, t_e, ch, vmin, vmax)
+        for rank, t in reversed(list(enumerate(tiles, start=1))):
+            significant = t["log10_p_single"] < log10_limit
+            _draw_box(ax, ch, t, f"{rank}", colour, linestyle="-" if significant else "--",
+                      linewidth=2.0 if rank == 1 else 1.2)
+        ax.set_title(name)
+        ax.set_xlabel("Time [s]")
+    lines = [f"{rank}: SNR {t['snr_unexplained']:.1f}, {t['t_range'][0] * 1e3:.2f}-{t['t_range'][1] * 1e3:.2f} ms"
+             + (f" + {t['t_wrap'][0] * 1e3:.2f}-{t['t_wrap'][1] * 1e3:.2f} ms" if t.get("t_wrap") else "")
+             + f", {t['channel_range'][0]:.0f}-{t['channel_range'][1]:.0f} MHz"
+             + ("" if t["log10_p_single"] < log10_limit else " (not significant)")
+             for rank, t in enumerate(tiles, start=1)]
+    axes[0][1].text(0.99, 0.99, "\n".join(lines), transform=axes[0][1].transAxes, ha="right", va="top",
+                    fontsize=7, color="k", bbox=dict(facecolor="white", alpha=0.8, edgecolor="none"))
+    axes[0][0].set_ylabel(ch.label)
+    verdict = "add a pulse" if result["add_pulse"] else "stop"
+    fig.suptitle(_title(burst, f"Unexplained residual, tolerating {result['epsilon']:.0%} model error "
+                               f"(p = {result['p']:.2g}: {verdict}; solid = significant)",
+                        np.asarray(burst.freq_channels).size, ch.gaps), fontsize=10)
+    fig.tight_layout()
+    plt.show()
+    return fig
+
+
+def plot_boxes_explained(burst, M_FD_old, M_FD_new, check, vlim=None, pct=(1.0, 99.0),
+                         rebaseline=True, freq_unit="MHz"):
+    """
+    The check of postprocess.boxes_explained, in TIME: the residual of the old fit, the residual of
+    the new fit (normally one more pulse), and the change in the model between them, each with the
+    old fit's significant boxes outlined -- white where the change explains leftover signal, red
+    where it does not, dashed grey where the model hardly changed inside the box. Each box is
+    numbered and listed with its efficiency and the SNR of the model change inside it.
+
+    burst:      the ConditionedData both fits used
+    M_FD_old, M_FD_new: the two models, as passed to boxes_explained
+    check:      the dict boxes_explained returned
+    vlim, pct:  colour limits (shared by all three panels); default the `pct` percentiles of the
+                old residual
+    rebaseline: subtract each channel's median over time (display only; see the module note)
+    freq_unit:  unit of the frequency-channel axis
+
+    Returns the figure.
+    """
+    data_td = np.asarray(to_time_domain(burst, jnp.asarray(burst.data_fd)))
+    old_td = np.asarray(to_time_domain(burst, jnp.asarray(M_FD_old)))
+    new_td = np.asarray(to_time_domain(burst, jnp.asarray(M_FD_new)))
+    panels = [("Residual, old fit", data_td - old_td), ("Residual, new fit", data_td - new_td),
+              ("Model change (new - old)", new_td - old_td)]
+    if rebaseline:
+        _announce_rebaseline()
+        panels = [(name, _subtract_median(X)) for name, X in panels]
+
+    t_c, t_e = _time_axis(burst)
+    ch = _channel_layout(burst, freq_unit)
+    vmin, vmax = vlim if vlim is not None else np.nanpercentile(panels[0][1], pct)
+
+    def style(b):
+        if b["removed"]:
+            return "white", "-"
+        if np.isfinite(b["efficiency"]) and b["change_snr"] >= 5.0:
+            return "red", "-"
+        return "0.7", "--"
+
+    fig, axes = plt.subplots(1, 3, figsize=(19, 5.5), sharey=True, squeeze=False)
+    for ax, (name, X) in zip(axes[0], panels):
+        _draw_waterfall(ax, X, t_e, ch, vmin, vmax)
+        for rank, b in reversed(list(enumerate(check["boxes"], start=1))):
+            c, ls = style(b)
+            _draw_box(ax, ch, b, f"{rank}", c, linestyle=ls, linewidth=2.5)
+        ax.set_title(name)
+        ax.set_xlabel("Time [s]")
+    lines = [f"{rank}: efficiency {b['efficiency']:+.2f}, model change SNR {b['change_snr']:.1f} -> "
+             f"{'explained' if b['removed'] else 'not explained'}"
+             for rank, b in enumerate(check["boxes"], start=1)]
+    axes[0][0].text(0.99, 0.99, "\n".join(lines) if lines else "no significant box",
+                    transform=axes[0][0].transAxes, ha="right", va="top", fontsize=7, color="k",
+                    bbox=dict(facecolor="white", alpha=0.8, edgecolor="none"))
+    axes[0][0].set_ylabel(ch.label)
+    verdict = ("the new pulse fits leftover signal" if check["any_removed"]
+               else "the new pulse fits none of the leftover signal")
+    fig.suptitle(_title(burst, f"Boxes explained by the new fit: {verdict} (white = explained, "
+                               f"red = not explained, dashed = model unchanged there)",
+                        np.asarray(burst.freq_channels).size, ch.gaps), fontsize=10)
+    fig.tight_layout()
     plt.show()
     return fig

@@ -21,6 +21,8 @@ def _fn_name(fn):
     """Name of a function for the run record; netcdf attributes cannot hold the function itself."""
     if fn is None:
         return ""
+    if isinstance(fn, str):           # model.py stores the SED and pulse functions by name already
+        return fn
     return getattr(fn, "__name__", type(fn).__name__)
 
 
