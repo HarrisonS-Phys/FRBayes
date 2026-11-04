@@ -804,11 +804,12 @@ def _format_time(box):
     return text
 
 
-def _dyadic_ranges(n):
-    """Contiguous index ranges [start, stop) of widths 1, 2, 4, ... (and n), each width at starts
-    spaced by half the width, so every interval is covered by a range at most about twice as long."""
+def _dyadic_ranges(n, min_width=1):
+    """Contiguous index ranges [start, stop) of widths min_width, 2 min_width, 4 min_width, ...
+    (and n), each width at starts spaced by half the width, so every interval at least min_width
+    long is covered by a range at most about twice as long."""
     out = set()
-    w = 1
+    w = max(1, min(int(min_width), n))
     while w <= n:
         step = max(w // 2, 1)
         out.update((s, s + w) for s in range(0, n - w + 1, step))
@@ -835,8 +836,45 @@ def _cell_powers(X, n_b):
     return np.abs(_cells(X, n_b)) ** 2
 
 
+def min_box_channels(burst, priors):
+    """
+    The fewest adjacent channels a residual box may span: the narrowest band in which the spectral
+    prior lets a single pulse put its power, for a pulse whose spectrum peaks inside the band.
+    Pass it to excess_power_search(..., min_channels=...).
+
+    The running power law ln F = gamma x + beta x^2, x = ln(nu / nu_ref), is a Gaussian in x for
+    beta < 0, and its power F^2 has standard deviation 1 / (2 sqrt|beta|). The most negative beta
+    the prior allows gives the narrowest, with full width at half maximum
+        FWHM_x = 2 sqrt(2 ln 2) / (2 sqrt|beta_min|),
+    i.e. from nu up to nu exp(FWHM_x), narrowest in MHz at the bottom of the band. Returns the
+    fewest channel centres inside such a window, over every start channel whose window fits in the
+    band (at least 1). With c1, c2 sampled, beta = beta_c2 c2 (burst.spectral_coeff_map).
+
+    Not covered: spectra so steep that a pulse's power sits in a sliver at the edge of the band.
+    Such a sliver still falls inside the boxes of this width at that edge.
+
+    burst:  the ConditionedData of the burst
+    priors: the priors of the fit (set_priors); needs a bounded 'beta' or 'c2' prior, else 1
+    """
+    if "beta" in priors:
+        beta_min = float(priors["beta"].low)
+    elif "c2" in priors:
+        a2 = float(burst.spectral_coeff_map["beta_c2"])
+        beta_min = min(a2 * float(priors["c2"].low), a2 * float(priors["c2"].high))
+    else:
+        return 1
+    if beta_min >= 0:
+        return 1
+    fwhm_x = 2.0 * np.sqrt(2.0 * np.log(2.0)) / (2.0 * np.sqrt(-beta_min))
+    nu = np.sort(np.asarray(burst.freq_channels, dtype=float).reshape(-1))
+    starts = nu[nu * np.exp(fwhm_x) <= nu[-1]]
+    if starts.size == 0:
+        return int(nu.size)
+    return int(max(1, min(np.sum((nu >= v) & (nu < v * np.exp(fwhm_x))) for v in starts)))
+
+
 def excess_power_search(burst, M_FD, epsilon=0.2, min_snr=0.0, resolutions=None, p_false_alarm=0.01,
-                        robust_scale="global", top=5, verbose=True):
+                        x_min=1.0, min_channels=1, top=5, verbose=True):
     """
     Is there signal in the residual that neither noise nor a tolerated error of the fitted model
     explains? An excess-power search (Anderson, Brady, Creighton & Flanagan 2001, Phys. Rev. D 63,
@@ -849,23 +887,22 @@ def excess_power_search(burst, M_FD, epsilon=0.2, min_snr=0.0, resolutions=None,
                    leftover power up to epsilon^2 times the model's power in it. Where the model is
                    bright this is a relative test (leftover must exceed epsilon times the model's
                    SNR there); where the model is absent it is a plain test against noise.
-    min_snr:       also require the unexplained SNR of the best box to reach this before adding a
-                   pulse (0: decide on the p-value alone)
+    min_snr:       also require the unexplained SNR of a box to reach this for it to count as
+                   significant (0: decide on the p-value alone)
     resolutions:   numbers of Fourier bins per band, n_b, each giving one tiling of time and Fourier
                    frequency with cells of duration W / n_b (W the segment duration). Default: 1, 2,
                    4, ... up to all retained bins.
     p_false_alarm: false-alarm probability of the whole search, after the trials correction
-    robust_scale:  "global" rescales the noise by one number so that the median power of the cells
-                   where the model is fainter than the noise matches pure noise (absorbing a common
-                   error in sigma_noise_fd, to which large boxes are sensitive); "channel" does so
-                   channel by channel; None uses sigma_noise_fd as it is
-    top:           how many of the most significant DISTINCT boxes to return: a box overlapping a
-                   more significant one in both time and channel is skipped, so the list shows
-                   separate features rather than one feature at several resolutions
+    x_min:        two significant boxes are separate features only if they are this far apart in
+                   units of their summed widths (see SEPARATE FEATURES); use the same x_min as the
+                   likelihood's repulsion
+    min_channels:  fewest adjacent channels a box may span; min_box_channels gives the narrowest
+                   band the spectral prior lets one pulse occupy. 1 allows single-channel boxes.
+    top:           when nothing is significant, how many of the strongest boxes to return for display
     verbose:       print the outcome
 
     METHOD. The residual R = data_fd - M_FD and the model M_FD are both whitened by
-    sigma_noise_fd. For a resolution n_b, the retained bins are cut into bands of n_b consecutive
+    sigma_noise_fd, the same noise the likelihood uses. For a resolution n_b, the retained bins are cut into bands of n_b consecutive
     bins and each band is inverse-DFT'd (unitary) into n_b time cells: the band-passed signal in
     time. Each residual cell is a complex N(0, 1) pair under pure noise, so its power is chi^2 with
     2 degrees of freedom, and the model's power in the same cell, P_model, is its SNR^2 there. A
@@ -884,14 +921,37 @@ def excess_power_search(burst, M_FD, epsilon=0.2, min_snr=0.0, resolutions=None,
     No guard band is needed around the pulses: a bright pulse's misfit leaks into neighbouring
     cells through the band edges, but so does the model, so the tolerance leaks with it.
 
-    Returns a dict: 'add_pulse' (p < p_false_alarm and snr_unexplained >= min_snr), 'p'
-    (corrected), 'n_tiles', 'tiles' (the `top` best boxes: t_range (s), t_wrap (the part at the
-    end of the segment, (start, W), for a box including the first time cell, which straddles the
-    segment's start and wraps to its end; else None), channel_range (MHz),
-    channel_index, band_index, time_index (each (first, last + 1) on the box's own grid),
-    fourier_band (Hz), significant (on its own, after the trials correction), n_cells, snr_unexplained, snr_residual, snr_model, log10_p_single,
-    resolution), 'noise_scale' (factor applied to sigma_noise_fd, per channel), 'epsilon' and
-    'p_false_alarm'. plotting.plot_residual_tiles draws the boxes on the data and residual.
+    SEPARATE FEATURES. A box is significant on its own when p_single, times the number of boxes,
+    is below p_false_alarm. A large box holding several features is often the MOST significant,
+    since it adds up all their leftover power. So features are found in two steps.
+    Step 1, which features are separate: the significant boxes are taken SMALLEST first, and a box
+    is a new feature only if
+      - no feature already kept has its centre inside the box's time span, and
+      - its centre c and width w are clear of every kept feature's, |c - c_k| >= x_min (w + w_k),
+        the condition the repulsion wall puts on two pulses.
+    Channels play no part: every pulse spans the whole band, so boxes at the same time in different
+    channels are the same feature. c and w are the mean and sqrt(2) x the standard deviation over
+    the box's times of its unexplained power at full time resolution: the residual and model on the
+    box's channels and Fourier band, transformed (unitary) to time, giving
+        u(t) = sum_c |r_c(t)|^2 - 2 K C / N - epsilon^2 sum_c |m_c(t)|^2,  clipped at 0
+    (K bins, C channels, N time samples); sqrt(2) turns the spread of a Gaussian's power into the
+    spread of its amplitude.
+    Step 2, which box represents each feature: the most significant box whose time span holds
+    that feature's centre and no other feature's. A box holding two features' centres represents
+    neither, so the features stay separate, while each is represented by the box that captures it
+    best -- usually the whole feature rather than its brightest corner, so that boxes_explained
+    measures everything a new pulse changes there, and warm starts use all its channels.
+
+    Returns a dict: 'add_pulse' (p < p_false_alarm and some box significant), 'p' (corrected),
+    'n_tiles', 'n_significant' (boxes significant on their own), 'tiles' (the separate significant
+    features, most significant first, or, if there are none, the `top` strongest boxes for display,
+    none overlapping another in time: each with t_range (s), t_wrap (the part at the end of the
+    segment, (start, W), for a box including the first time cell, which straddles the segment's
+    start and wraps to its end; else None), channel_range (MHz), channel_index, band_index,
+    time_index (each (first, last + 1) on the box's own grid), fourier_band (Hz), significant,
+    n_cells, snr_unexplained, snr_residual, snr_model, log10_p_single, resolution, and for the
+    significant features centre and width (s)), 'epsilon' and 'p_false_alarm'.
+    plotting.plot_residual_tiles draws the boxes on the data and residual.
     """
     from scipy.stats import chi2
 
@@ -899,47 +959,55 @@ def excess_power_search(burst, M_FD, epsilon=0.2, min_snr=0.0, resolutions=None,
     Z = (np.asarray(burst.data_fd) - np.asarray(M_FD)) / sigma
     Zm = np.asarray(M_FD) / sigma
     n_chan, n_ret = Z.shape
-    W = float(burst.n_time * burst.dt)
+    n_time, dt = int(burst.n_time), float(burst.dt)
+    W = n_time * dt
     f = np.asarray(burst.fourier_freqs, dtype=float).reshape(-1)
     nu = np.asarray(burst.freq_channels, dtype=float).reshape(-1)
     if resolutions is None:
         resolutions = [2 ** j for j in range(int(np.log2(n_ret)) + 1)]
         if resolutions[-1] != n_ret:
             resolutions.append(n_ret)
-    if robust_scale not in (None, False, "global", "channel"):
-        raise ValueError("robust_scale must be 'global', 'channel' or None")
+    resolutions = [n_b for n_b in resolutions if n_ret // n_b > 0]
 
     def plane(X, n_b):
         return _cell_powers(X, n_b)
-
-    scale = np.ones(n_chan)
-    if robust_scale:
-        n_ref = min(32, n_ret)
-        ref, faint = plane(Z, n_ref), plane(Zm, n_ref) < 1.0       # cells where the model is below the noise
-        if robust_scale == "channel":
-            med = np.array([np.median(ref[c][faint[c]]) if faint[c].sum() > 20 else np.median(ref[c])
-                            for c in range(n_chan)])
-        else:
-            med = np.full(n_chan, np.median(ref[faint]) if faint.sum() > 20 * n_chan else np.median(ref))
-        scale = med / (2.0 * np.log(2.0))                            # median of chi^2_2 is 2 ln 2
-        Z, Zm = Z / np.sqrt(scale)[:, None], Zm / np.sqrt(scale)[:, None]
 
     def table(P):
         S = np.zeros((P.shape[0] + 1, P.shape[1] + 1, P.shape[2] + 1))
         S[1:, 1:, 1:] = P.cumsum(0).cumsum(1).cumsum(2)              # summed-volume table
         return S
 
-    log_p_best, best = [], []
-    n_tiles = 0
+    ranges = {n_b: (_dyadic_ranges(n_chan, min_channels), _dyadic_ranges(n_ret // n_b), _dyadic_ranges(n_b))
+              for n_b in resolutions}
+    n_tiles = sum(len(c[0]) * len(b[0]) * len(t[0]) for c, b, t in ranges.values())
+    log_limit = np.log(p_false_alarm) - np.log(n_tiles)               # significant on its own
+
+    def make_tile(n_b, c0, c1, b0, b1, t0, t1, e, v, lam, pm, logp):
+        cell = W / n_b
+        lo, hi = (t0 - 0.5) * cell, (t1 - 0.5) * cell
+        k0, k1 = b0 * n_b, b1 * n_b
+        # Cell m is centred at m W / n_b, so cell 0 straddles the start of the segment and wraps
+        # to its end: a box including it also covers [W + lo, W) (the whole segment at n_b = 1)
+        return dict(
+            t_range=(max(lo, 0.0), min(hi, W)),
+            t_wrap=(W + lo, W) if lo < 0 else None,
+            channel_range=(float(nu[c0]), float(nu[c1 - 1])),
+            channel_index=(int(c0), int(c1)),
+            band_index=(int(b0), int(b1)),
+            time_index=(int(t0), int(t1)),
+            fourier_band=(float(f[k0]), float(f[k1 - 1])),
+            n_cells=int(v),
+            snr_unexplained=float(np.sqrt(max(e - 2 * v - lam, 0.0))),
+            snr_residual=float(np.sqrt(max(e - 2 * v, 0.0))),
+            snr_model=float(np.sqrt(pm)),
+            log10_p_single=float(logp / np.log(10)), resolution=int(n_b),
+            significant=bool(logp < log_limit and e - 2 * v - lam >= min_snr ** 2))
+
     eps2 = float(epsilon) ** 2
+    strongest, significant = [], []
     for n_b in resolutions:
-        n_bands = n_ret // n_b
-        if n_bands == 0:
-            continue
+        (cs, ce), (bs, be), (ts, te) = ranges[n_b]
         S, Sm = table(plane(Z, n_b)), table(plane(Zm, n_b))
-        cs, ce = _dyadic_ranges(n_chan)
-        bs, be = _dyadic_ranges(n_bands)
-        ts, te = _dyadic_ranges(n_b)
         c0, c1 = cs[:, None, None], ce[:, None, None]
         b0, b1 = bs[None, :, None], be[None, :, None]
         t0, t1 = ts[None, None, :], te[None, None, :]
@@ -954,67 +1022,95 @@ def excess_power_search(burst, M_FD, epsilon=0.2, min_snr=0.0, resolutions=None,
         k = 2.0 * V
         c = (k + 2 * L) / (k + L)
         logp = chi2.logsf(E / c, (k + L) ** 2 / (k + 2 * L))
-        n_tiles += logp.size
-        cell = W / n_b
-        n_keep = min(20 * top, logp.size)
-        cand = np.argpartition(logp, n_keep - 1, axis=None)[:n_keep]
-        for i in cand:
-            ci, bi, ti = np.unravel_index(i, logp.shape)
-            k0, k1 = bs[bi] * n_b, be[bi] * n_b
-            e, v, lam, pm = E[ci, bi, ti], V[ci, bi, ti], L[ci, bi, ti], Pm[ci, bi, ti]
-            log_p_best.append(float(logp[ci, bi, ti]))
-            # Cell m is centred at m W / n_b, so cell 0 straddles the start of the segment and wraps
-            # to its end: a box including it also covers [W + lo, W) (the whole segment at n_b = 1)
-            lo, hi = (ts[ti] - 0.5) * cell, (te[ti] - 0.5) * cell
-            best.append(dict(
-                t_range=(max(lo, 0.0), min(hi, W)),
-                t_wrap=(W + lo, W) if lo < 0 else None,
-                channel_range=(float(nu[cs[ci]]), float(nu[ce[ci] - 1])),
-                channel_index=(int(cs[ci]), int(ce[ci])),
-                band_index=(int(bs[bi]), int(be[bi])),
-                time_index=(int(ts[ti]), int(te[ti])),
-                fourier_band=(float(f[k0]), float(f[k1 - 1])),
-                n_cells=int(v),
-                snr_unexplained=float(np.sqrt(max(e - 2 * v - lam, 0.0))),
-                snr_residual=float(np.sqrt(max(e - 2 * v, 0.0))),
-                snr_model=float(np.sqrt(pm)),
-                log10_p_single=float(logp[ci, bi, ti] / np.log(10)), resolution=int(n_b)))
 
-    order = np.argsort(log_p_best)
-    p = float(np.exp(min(0.0, log_p_best[order[0]] + np.log(n_tiles))))
+        def tile_at(i):
+            ci, bi, ti = np.unravel_index(i, logp.shape)
+            return make_tile(n_b, cs[ci], ce[ci], bs[bi], be[bi], ts[ti], te[ti],
+                             E[ci, bi, ti], V[ci, bi, ti], L[ci, bi, ti], Pm[ci, bi, ti], logp[ci, bi, ti])
+
+        n_keep = min(20 * top, logp.size)
+        strongest += [tile_at(i) for i in np.argpartition(logp, n_keep - 1, axis=None)[:n_keep]]
+        sig = np.flatnonzero((logp < log_limit) & (E - k - L >= min_snr ** 2))
+        significant += [tile_at(i) for i in sig]
+
+    strongest.sort(key=lambda tile: tile["log10_p_single"])
+    best = strongest[0]
+    p = float(min(1.0, 10.0 ** (best["log10_p_single"] + np.log10(n_tiles))))
 
     def spans(tile):
         return [tile["t_range"]] + ([tile["t_wrap"]] if tile["t_wrap"] else [])
 
-    def overlaps(a, b):
-        in_time = any(x0 < y1 and y0 < x1 for x0, x1 in spans(a) for y0, y1 in spans(b))
-        return in_time and a["channel_index"][0] < b["channel_index"][1] and b["channel_index"][0] < a["channel_index"][1]
+    def in_time(t, tile):
+        return any(a <= t <= b for a, b in spans(tile))
 
-    tiles = []
-    for i in order:
-        if not any(overlaps(best[i], t) for t in tiles):
-            tiles.append(best[i])
-        if len(tiles) == top:
-            break
-    log10_limit = np.log10(p_false_alarm) - np.log10(n_tiles)
-    for tile in tiles:
-        tile["significant"] = bool(tile["log10_p_single"] < log10_limit
-                                   and tile["snr_unexplained"] >= min_snr)
-    t = tiles[0]
-    add = bool(p < p_false_alarm and t["snr_unexplained"] >= min_snr)
-    out = dict(add_pulse=add, p=p, n_tiles=n_tiles, tiles=tiles, noise_scale=np.sqrt(scale),
+    k_full = np.rint(f * n_time * dt).astype(int)
+    t_axis = np.arange(n_time) * dt
+
+    def centre_width(tile):
+        """Mean and sqrt(2) x spread over the box's times of its unexplained power at full resolution."""
+        (c0, c1), n_b = tile["channel_index"], tile["resolution"]
+        j0, j1 = tile["band_index"][0] * n_b, tile["band_index"][1] * n_b
+
+        def power(X):
+            full = np.zeros((c1 - c0, n_time), dtype=complex)
+            full[:, k_full[j0:j1]] = X[c0:c1, j0:j1]
+            return np.sum(np.abs(np.fft.ifft(full, axis=-1) * np.sqrt(n_time)) ** 2, axis=0)
+
+        u = np.maximum(power(Z) - 2.0 * (c1 - c0) * (j1 - j0) / n_time - eps2 * power(Zm), 0.0)
+        u = u * np.any([(t_axis >= a) & (t_axis <= b) for a, b in spans(tile)], axis=0)
+        if u.sum() <= 0:
+            a, b = tile["t_range"]
+            return 0.5 * (a + b), (b - a) / np.sqrt(12.0)
+        mean = np.sum(u * t_axis) / u.sum()
+        return float(mean), float(np.sqrt(2.0 * np.sum(u * (t_axis - mean) ** 2) / u.sum()))
+
+    # Step 1, which features are separate: smallest significant boxes first, each kept only if
+    # clear of those kept
+    found = []
+    for tile in sorted(significant, key=lambda tile: (tile["n_cells"], tile["log10_p_single"])):
+        if any(in_time(kept["centre"], tile) for kept in found):
+            continue
+        centre, width = centre_width(tile)
+        if all(abs(centre - kept["centre"]) >= x_min * (width + kept["width"]) for kept in found):
+            found.append(dict(tile, centre=centre, width=width))
+
+    # Step 2, which box represents each feature: the most significant box whose time span holds
+    # that feature's centre and no other feature's (the smallest box itself if none does)
+    features = []
+    for k, feature in enumerate(found):
+        others = [f["centre"] for j, f in enumerate(found) if j != k]
+        own = [tile for tile in significant
+               if in_time(feature["centre"], tile) and not any(in_time(c, tile) for c in others)]
+        best_box = min(own, key=lambda tile: tile["log10_p_single"]) if own else feature
+        features.append(dict(best_box, centre=feature["centre"], width=feature["width"]))
+    features.sort(key=lambda tile: tile["log10_p_single"])
+
+    if features:
+        tiles = features
+    else:
+        tiles = []                         # nothing significant: the strongest boxes, apart in time
+        for tile in strongest:
+            if not any(x0 < y1 and y0 < x1 for kept in tiles for x0, x1 in spans(tile) for y0, y1 in spans(kept)):
+                tiles.append(tile)
+            if len(tiles) == top:
+                break
+
+    add = bool(p < p_false_alarm and len(features) > 0)
+    out = dict(add_pulse=add, p=p, n_tiles=n_tiles, n_significant=len(significant), tiles=tiles,
                epsilon=float(epsilon), p_false_alarm=float(p_false_alarm))
 
     if verbose:
-        print(f"Residual test (tolerating {epsilon:.0%} model error): strongest unexplained residual "
-              f"SNR {t['snr_unexplained']:.1f} at {_format_time(t)}, "
-              f"{t['channel_range'][0]:.0f}-{t['channel_range'][1]:.0f} MHz "
-              f"(residual SNR {t['snr_residual']:.1f}, model SNR there {t['snr_model']:.1f})")
-        print(f"  -> {'ADD A PULSE' if add else 'stop'} (p = {p:.2g} after {n_tiles} boxes"
-              + (f"; min_snr {min_snr:g}" if min_snr else "") + ")")
-        s = np.sqrt(scale)
-        if robust_scale and (s.max() > 1.1 or s.min() < 0.9):
-            print(f"  note: noise is {s.mean():.2f} x sigma_noise_fd; rescaled before testing")
+        print(f"Residual test (tolerating {epsilon:.0%} model error): {'ADD A PULSE' if add else 'stop'} "
+              f"(p = {p:.2g} after {n_tiles} boxes" + (f"; min_snr {min_snr:g}" if min_snr else "") + ")")
+        if features:
+            print(f"  {len(significant)} boxes significant on their own, making {len(features)} separate feature(s):")
+        else:
+            print("  nothing significant; strongest box:")
+        for t in tiles if features else tiles[:1]:
+            where = (f", centre {t['centre'] * 1e3:.2f} ms, width {t['width'] * 1e3:.2f} ms" if "centre" in t else "")
+            print(f"    {_format_time(t)}, {t['channel_range'][0]:.0f}-{t['channel_range'][1]:.0f} MHz: "
+                  f"unexplained SNR {t['snr_unexplained']:.1f} (residual {t['snr_residual']:.1f}, "
+                  f"model {t['snr_model']:.1f}){where}")
     return out
 
 
@@ -1068,11 +1164,10 @@ def boxes_explained(burst, M_FD_old, M_FD_new, result, min_efficiency=0.5, min_c
     """
     log10_limit = np.log10(result["p_false_alarm"]) - np.log10(result["n_tiles"])
     sigma = np.broadcast_to(np.asarray(burst.sigma_noise_fd, dtype=float), np.shape(burst.data_fd))
-    scale = np.asarray(result["noise_scale"], dtype=float).reshape(-1, 1)       # applied to sigma
     data = np.asarray(burst.data_fd)
     M_old, M_new = np.asarray(M_FD_old), np.asarray(M_FD_new)
-    R_old = (data - M_old) / (sigma * scale)
-    D = (M_new - M_old) / (sigma * scale)
+    R_old = (data - M_old) / sigma
+    D = (M_new - M_old) / sigma
 
     boxes = []
     for t in result["tiles"]:

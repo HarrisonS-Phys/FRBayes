@@ -64,11 +64,26 @@ def describe_data(path, event_id=None, n_bytes=None):
 
 
 def save_run(path, mcmc, burst, priors, data_path, single_pulse_fn=None,
-             event_id=None, hash_bytes=None, extra_samples=None, **extra):
+             event_id=None, hash_bytes=None, extra_samples=None, dm_dedispersion=None,
+             dedispersion_ref_freq=None, **extra):
     """
     Writes a fit to netcdf: posterior samples, plus the conditioning needed to interpret them.
 
-    mcmc:            the finished MCMC object; samples are taken with group_by_chain=True, so the
+    dm_dedispersion: REQUIRED. The DM (pc cm^-3) the data were dedispersed with before this fit,
+                     e.g. from DM_phase. The fitted 'DM' is only the residual on top of it, so it is
+                     recorded as the attribute 'DM_dedispersion', and the posterior gets 'DM_total'
+                     = dm_dedispersion + DM, draw by draw. It is added as an exact number: the
+                     dedispersion is a known shift applied to the data, and the fit measures what
+                     remains, so the spread of DM_total is the spread of the residual DM.
+    dedispersion_ref_freq:
+                     REQUIRED. The frequency (MHz) the dedispersion aligned the channels to (np.inf
+                     for infinite frequency), recorded as 'dedispersion_ref_freq'. The data's time
+                     axis keeps the telescope's clock only at this frequency; every other channel was
+                     shifted by k DM_dedispersion (nu^-2 - nu_dd^-2). The fitted arrival time t at
+                     the model's reference nu_r therefore corresponds to the arrival time
+                     t + k DM_dedispersion (nu_r^-2 - nu_dd^-2) on the telescope's clock, which can
+                     only be recovered with nu_dd.
+    mcmc:           the finished MCMC object; samples are taken with group_by_chain=True, so the
                      leading two axes are (chain, draw) with no shape guessing
     burst:           the ConditionedData the fit used
     priors:          the priors dictionary of the fit, as returned by run.set_priors. For a
@@ -86,8 +101,22 @@ def save_run(path, mcmc, burst, priors, data_path, single_pulse_fn=None,
     The reference frequency is recorded because gamma and tau_ref are defined relative to it and
     it differs per burst; the spectral basis because c1 and c2 are meaningless without it.
     """
+    if dm_dedispersion is None:
+        raise ValueError("dm_dedispersion must be given: the DM (pc cm^-3) the data were dedispersed "
+                         "with before this fit. The fitted DM is only the residual on top of it.")
+    dm_dedispersion = float(dm_dedispersion)
+    if dedispersion_ref_freq is None:
+        raise ValueError("dedispersion_ref_freq must be given: the frequency (MHz, np.inf for infinite "
+                         "frequency) the dedispersion aligned the channels to. Without it the fitted "
+                         "arrival times cannot be converted to the telescope's clock.")
+    dedispersion_ref_freq = float(dedispersion_ref_freq)
+
     samples = {k: np.asarray(v) for k, v in mcmc.get_samples(group_by_chain=True).items()}
     n_chains, n_draws = next(iter(samples.values())).shape[:2]
+    if "DM_total" in samples or "DM_total" in (extra_samples or {}):
+        raise ValueError("'DM_total' is computed by save_run and cannot be a sampled site or extra sample.")
+    if "DM" in samples:
+        samples["DM_total"] = dm_dedispersion + samples["DM"]      # residual DM on top of the dedispersion DM
 
     for name, value in (extra_samples or {}).items():
         if name in samples:
@@ -112,6 +141,8 @@ def save_run(path, mcmc, burst, priors, data_path, single_pulse_fn=None,
         "sed_fn": _fn_name(getattr(single_pulse_fn, "sed_fn", None)),
         "pulse_fn": _fn_name(getattr(single_pulse_fn, "pulse_fn", None)),
         "freq_channels_ref": f"{burst.freq_channels_ref:.6f}",
+        "DM_dedispersion": repr(dm_dedispersion),      # pc cm^-3, applied to the data before the fit
+        "dedispersion_ref_freq": repr(dedispersion_ref_freq),   # MHz the channels were aligned to (inf allowed)
         "n_noise_bins": str(burst.n_noise_bins),
         "shared_params": ",".join(sorted(k.removesuffix("_shared") for k in samples
                                          if k.endswith("_shared"))), # Parameters sampled once for the whole burst, found from their '<name>_shared' sites

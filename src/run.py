@@ -14,6 +14,12 @@ A fit is then three calls, followed by saving with results.save_run:
     idata  = save_run(out_path, mcmc, burst, priors, data_path,
                       single_pulse_fn=single_pulse_fn, extra_samples=extra)
 
+To let the data decide how many pulses there are, iterative_pulse_fit fits 1, 2, ... pulses,
+adding one at a time while the residual holds leftover signal that a new pulse explains:
+
+    result = iterative_pulse_fit(burst, single_pulse_fn, snr_min=8.0, n_max=5, seed=2)
+    result["n_pulses"], result["fit"]["mcmc"]
+
 THE AMPLITUDE PRIOR IS SET ONCE, in set_priors, as 'A_snr' ~ HalfNormal(s_opt), in units of the
 template's optimal SNR. The unmarginalized likelihood samples it directly. The marginalized
 likelihoods integrate over that same prior analytically, so run_fit removes 'A_snr' from the
@@ -35,6 +41,7 @@ import numpy as np
 import numpyro.distributions as dist
 from numpyro.distributions.transforms import biject_to
 from numpyro.infer import MCMC, NUTS, init_to_value
+from numpyro.infer.util import initialize_model
 from functools import partial
 
 from likelihood import (
@@ -45,6 +52,7 @@ from likelihood import (
     draw_fluences_halfnormal_nooverlap_gaussmarg,
     wraparound_ratio_posthoc,
     fluence_for_normalized_log_sed_models,
+    repulsive_toa_prior,
 )
 from priors import dispersion_prior_bounds, spectral_coeff_bounds, width_prior_bounds
 from results import describe_priors
@@ -82,8 +90,12 @@ def set_priors(
     Defaults:
         mean_arrival_time  Uniform over the segment
         DM                 Uniform(-D_max, D_max), from dispersion_prior_bounds
-        sigma, tau_ref     Uniform, from width_prior_bounds at `toa`; the upper bound on sigma
-                           is divided by n_pulses if shrink_sigma_npulses
+        sigma              LogUniform, from width_prior_bounds at `toa`: equal weight per decade
+                           of width, since the width's scale is not known in advance. The lower
+                           bound is the resolution floor, where unresolved pulses collect. The upper
+                           bound is divided by n_pulses if shrink_sigma_npulses.
+        tau_ref            Uniform, from width_prior_bounds at `toa`. Flat rather than log-uniform,
+                           so that no scattering (tau_ref -> 0) stays inside the prior.
         c1, c2             Uniform, from spectral_coeff_bounds mapping the (gamma, beta) box
         A_snr              HalfNormal(s_opt), only if s_opt is given
 
@@ -134,7 +146,7 @@ def set_priors(
     priors = {
         "mean_arrival_time": dist.Uniform(0.0, float(burst.times[-1])),   # (s, relative to segment start)
         "DM": dist.Uniform(dm["DM_min"], dm["DM_max"]),                    # residual DM (pc cm^-3)
-        "sigma": dist.Uniform(width["sigma_min"], sigma_max),              # intrinsic width (s), per pulse
+        "sigma": dist.LogUniform(width["sigma_min"], sigma_max),           # intrinsic width (s), per pulse; scale-free
         "tau_ref": dist.Uniform(width["tau_ref_min"], width["tau_ref_max"]),  # scattering at nu_r (s)
     }
 
@@ -264,7 +276,7 @@ def _starting_values(burst, priors: Dict[str, dist.Distribution], n_pulses: int)
     See default_init for why each value is chosen.
     """
     targets = {"DM": 0.0, "c1": 0.0, "c2": 0.0, "gamma": 0.0, "beta": 0.0,
-               "tau_ref": 5.0 * burst.dt, "A_snr": 5.0}
+               "tau_ref": 0.5 * burst.dt, "A_snr": 5.0}
 
     sigma_init = None
     if getattr(priors.get("sigma"), "high", None) is not None:
@@ -411,6 +423,158 @@ def default_init(
 
     return init_to_value(values=values)
 
+
+def wall_clearance(burst, values, n_pulses, likelihood, likelihood_kwargs):
+    """
+    How far apart two starting pulses must be to clear the repulsion wall. Returns (x, tail): pulses
+    j and k clear it when |t_j - t_k| >= x (width_j + width_k), width = sqrt(sigma^2 + tail^2). x is 0
+    if the fit has no repulsion.
+
+    width is as in repulsive_toa_prior, with tail = tau_scale tau f at the starting tau, f the largest
+    band tau factor (nu / nu_ref)^-4 over the channels (1 without band_tau). All pulses start with
+    the same tau, so the shift of the centres by tau f is the same for both pulses of a pair and
+    cancels. x = x_min + 10 w: at x_min itself the soft wall still costs K ln 2 / softplus(x_min / w)
+    (~35 nats with the defaults), 10 w further on ~0.002 nats.
+    """
+    param = inspect.signature(likelihood).parameters.get("repulsion")
+    rep = likelihood_kwargs.get("repulsion", param.default if param is not None else None)
+    if rep is None or n_pulses == 1:
+        return 0.0, 0.0
+    rep = {**{name: p.default for name, p in inspect.signature(repulsive_toa_prior).parameters.items()
+              if p.default is not inspect.Parameter.empty}, **rep}
+    f = 1.0
+    if rep.get("band_tau", True):
+        nu = np.asarray(burst.freq_channels, dtype=float).reshape(-1) / float(burst.freq_channels_ref)
+        f = float(np.max(nu ** -4.0))
+    if "tau_ref_shared" in values:
+        tau0 = float(values["tau_ref_shared"])
+    else:
+        tau0 = float(values["tau_ref"][0]) if "tau_ref" in values else 0.0
+    return float(rep["x_min"]) + 10.0 * float(rep["w"]), float(rep["tau_scale"]) * tau0 * f
+
+
+def _previous_fit_values(params, defaults, priors, n_pulses, reset=("tau_ref",)):
+    """
+    Starting values for a WARM chain: the previous fit's n_pulses - 1 pulses as they were, and one
+    new pulse, last, with the default starting values.
+
+    params:   one draw of the previous fit, name -> value: per-pulse values of shape (n_pulses - 1,),
+              shared ones ('<name>_shared') scalars. Sites the model does not sample are ignored.
+    defaults: _starting_values for n_pulses pulses; the new pulse takes its values from these (or
+              the median of the previous pulses for a parameter without a default).
+    priors:   the priors of the new fit; every value is moved just inside their bounds (e.g. a width
+              beyond a sigma bound that shrinks with n_pulses).
+    reset:    parameters NOT inherited, which start from their defaults instead (shared or not).
+              By default tau_ref: a component the previous fit was missing is often covered by an
+              inflated scattering tail (a shared tau stretched across it), and inheriting that tail
+              leaves the new pulse little to gain where the missing component is.
+    """
+    values = dict(defaults)
+    for name, v in params.items():
+        if name.removesuffix("_shared") in reset:
+            continue                                        # starts from its default instead
+        prior = priors.get(name.removesuffix("_shared"))
+        if prior is None:
+            continue                                        # deterministic, or not in this fit
+        v = np.asarray(v, dtype=float)
+        inside = np.vectorize(lambda u: _interior(prior, float(u)))
+        if name.endswith("_shared") and v.ndim == 0:
+            values[name] = jnp.float32(inside(v))
+        elif v.shape == (n_pulses - 1,):
+            new = float(np.asarray(defaults[name])[-1]) if name in defaults else float(np.median(v))
+            values[name] = jnp.asarray(np.append(inside(v), new), dtype=jnp.float32)
+        else:
+            raise ValueError(f"warm_start params['{name}'] has shape {v.shape}; expected "
+                             f"({n_pulses - 1},), one value per pulse of the previous fit.")
+    return values
+
+
+def box_times(burst, M_FD, result, n_pulses, num_chains, n_warm_chains, time_prior, sigma_range, seed,
+              clearance=(0.0, 0.0), fixed=None):
+    """
+    WARM-START arrival times and widths, each of shape (num_chains, n_pulses), from the residual boxes
+    of the previous fit.
+
+    The first n_warm_chains chains (warm) keep the `fixed` pulses -- the previous fit's, as they
+    were -- and put each NEW pulse in its own significant box of `result` (an excess_power_search of
+    the previous fit's residual; a random choice of boxes if there are more boxes than new pulses),
+    at a time drawn inside the box with probability proportional to |r(t)|^2: r is the whitened
+    residual on the box's channels and Fourier band, transformed to time and summed over those
+    channels. Every pulse of the remaining chains (random) gets a time drawn uniformly from the
+    arrival-time prior. Every pulse not fixed gets a width drawn log-uniformly over sigma_range (the
+    sigma prior).
+
+    Pulses are placed one at a time, and each is drawn only from times that clear the walls of the
+    pulses already placed (wall_clearance), so no draw is ever redone. A box with no such time left
+    gives its pulse a random time instead. If no time is left anywhere (widths too broad for the
+    segment), the pulse is drawn from the whole prior and the chain is reported as starting in a
+    wall.
+
+    burst:         the ConditionedData of the burst
+    M_FD:          the previous fit's model on the retained Fourier bins
+    result:        excess_power_search(burst, M_FD)
+    time_prior:    the arrival-time prior (bounded)
+    sigma_range:   (low, high) the widths are drawn log-uniformly between
+    seed:          integer the draws are made from
+    clearance:     (x, tail) from wall_clearance; tail may also be an array, one per chain
+    fixed:         (times, sigmas) of the pulses warm chains keep, each of shape (m,), m < n_pulses
+    """
+    x, tail = clearance
+    rng = np.random.default_rng(seed)
+    n, dt = int(burst.n_time), float(burst.dt)
+    t = np.arange(n) * dt
+    lo, hi = float(time_prior.low), float(time_prior.high)
+    pad = 1e-3 * (hi - lo)                                   # keep off the prior's edges
+    in_prior = (t >= lo + pad) & (t <= hi - pad)
+    Z = (np.asarray(burst.data_fd) - np.asarray(M_FD)) / np.asarray(burst.sigma_noise_fd)
+    k = np.rint(np.asarray(burst.fourier_freqs, dtype=float).reshape(-1) * n * dt).astype(int)
+
+    boxes = []
+    for tile in result["tiles"]:
+        if not tile["significant"]:
+            continue
+        (c0, c1), n_b = tile["channel_index"], tile["resolution"]
+        j0, j1 = tile["band_index"][0] * n_b, tile["band_index"][1] * n_b
+        full = np.zeros((c1 - c0, n), dtype=complex)
+        full[:, k[j0:j1]] = Z[c0:c1, j0:j1]
+        power = np.sum(np.abs(np.fft.ifft(full, axis=-1)) ** 2, axis=0)          # |r(t)|^2
+        spans = [tile["t_range"]] + ([tile["t_wrap"]] if tile["t_wrap"] else [])
+        inside = np.any([(t >= a) & (t <= b) for a, b in spans], axis=0)
+        boxes.append(np.where(inside & in_prior, power, 0.0))
+
+    log_lo, log_hi = np.log(sigma_range[0]), np.log(sigma_range[1])
+    sigmas = np.exp(rng.uniform(log_lo, log_hi, size=(num_chains, n_pulses)))   # log-uniform widths
+    times = np.empty((num_chains, n_pulses))
+    m = 0
+    if fixed is not None:                     # warm chains keep the previous fit's pulses as they were
+        m = len(fixed[0])
+        times[:n_warm_chains, :m], sigmas[:n_warm_chains, :m] = fixed[0], fixed[1]
+    tail = np.asarray(tail, dtype=float)
+    widths = np.sqrt(sigmas ** 2 + (tail.reshape(-1, 1) if tail.ndim else tail) ** 2)
+
+    in_wall = []
+    for c in range(num_chains):
+        warm = c < n_warm_chains
+        chosen = rng.permutation(len(boxes))[:n_pulses - m] if warm else []
+        for j in range(m if warm else 0, n_pulses):
+            free = in_prior & np.all([np.abs(t - times[c, i]) >= x * (widths[c, j] + widths[c, i])
+                                      for i in range(j)], axis=0)
+            jj = j - (m if warm else 0)                      # index among the pulses being placed
+            p = boxes[chosen[jj]] * free if jj < len(chosen) else free.astype(float)
+            if p.sum() <= 0:                                 # box full: start this pulse at random
+                p = free.astype(float)
+            if p.sum() <= 0:                                 # no free time left anywhere
+                p = in_prior.astype(float)
+                in_wall.append(c)
+            times[c, j] = rng.choice(t, p=p / p.sum())
+
+    in_wall = sorted(set(in_wall))
+    if in_wall:
+        print(f"box_times: {len(in_wall)} of {num_chains} chains could not keep every pulse out of the "
+              f"walls (widths too broad for {n_pulses} pulses in this segment): {in_wall}")
+    return times, sigmas
+
+
 def run_fit(
     burst,
     single_pulse_fn: Callable,
@@ -431,6 +595,9 @@ def run_fit(
     target_accept_prob: float = 0.8,
     ordered_times: bool = False, # Strict time ordering prior on pulses
     random_init_times: bool = True, # Randomize intialized toas for sampler
+    warm_start: dict = None,        # dict(result=excess_power_search result, M_FD=previous model)
+    n_warm_chains: int = None,      # chains warm-started from the boxes; None = all
+    warm_start_tau: bool = False,   # warm chains inherit the previous fit's tau_ref (default: start afresh)
     **likelihood_kwargs,
 ) -> MCMC:
     """
@@ -482,6 +649,25 @@ def run_fit(
     random_init_times: passed to default_init: True (default) draws each chain's starting arrival
                        times at random, False starts every chain from the same evenly spaced
                        times. Ignored if init_strategy is given.
+    warm_start:        dict(params=..., result=..., M_FD=...): the previous fit's maximum a
+                       posteriori draw (name -> value, one value per pulse or one for a shared
+                       parameter; it has n_pulses - 1 pulses), that draw's model, and an
+                       excess_power_search of its residual. The first n_warm_chains chains (warm)
+                       start from that draw, every parameter as it was except tau_ref, which starts
+                       afresh at 0.5 dt unless warm_start_tau, plus one new pulse in a significant
+                       box chosen at random, at a time drawn from the residual power there, with a
+                       log-uniform width and the default starting values otherwise.
+                       The other chains (random) start every pulse from scratch: times uniform,
+                       widths log-uniform over the sigma prior, everything else as in default_init,
+                       so a bad previous fit cannot trap every chain. No pulse starts inside another's
+                       wall where the segment has room (box_times). The starting times and widths
+                       are stored as mcmc.init_times and mcmc.init_sigma.
+    n_warm_chains:     how many chains start warm; None (default) all of them.
+    warm_start_tau:    True: warm chains also inherit the previous fit's tau_ref. False (default):
+                       tau_ref starts afresh at 0.5 dt, because a component the previous fit was
+                       missing is often covered by an inflated scattering tail (a shared tau
+                       stretched across it), and inheriting that tail leaves the new pulse little to
+                       gain where the missing component is.
     likelihood_kwargs: passed straight to the likelihood, e.g. containment=, containment_FD=,
                        apply_overlap_prior=. Arguments run_fit fills in itself (the data, priors,
                        model, spectral_coeff_map and s_opt) cannot be given here.
@@ -534,8 +720,7 @@ def run_fit(
     mcmc = MCMC(kernel, num_warmup=num_warmup, num_samples=num_samples, num_chains=num_chains,
                 chain_method=chain_method, progress_bar=progress_bar)
 
-    mcmc.run(
-        jax.random.PRNGKey(seed),
+    run_kwargs = dict(
         data_fd=burst.data_fd,
         sigma_noise_fd=burst.sigma_noise_fd,
         n_pulses=n_pulses,
@@ -543,13 +728,59 @@ def run_fit(
         single_pulse_fn=single_pulse_fn,
         # Only meaningful when sampling the orthogonal basis; with gamma and beta it must be None
         spectral_coeff_map=burst.spectral_coeff_map if "c1" in model_priors else None,
-        extra_fields=extra_fields,
         shared_params=shared_params,
         ordered_times=ordered_times,
         **model_kwargs,
         **likelihood_kwargs,
     )
 
+    # WARM START: warm chains from the previous fit plus one new pulse, random chains from scratch
+    init_params, init_times, init_sigma = None, None, None
+    if warm_start is not None:
+        time_param = "mean_arrival_time"
+        time_prior, sigma_prior = model_priors[time_param], model_priors.get("sigma")
+        if getattr(sigma_prior, "high", None) is None or "sigma" in shared_params:
+            raise ValueError("warm_start draws a width per pulse: it needs a bounded 'sigma' prior, not shared.")
+        n_warm = num_chains if n_warm_chains is None else n_warm_chains
+        values, _ = _starting_values(burst, model_priors, n_pulses)                          # random chains
+        warm_values = _previous_fit_values(warm_start["params"], values, model_priors, n_pulses,
+                                           reset=() if warm_start_tau else ("tau_ref",))     # warm chains
+
+        def unconstrained(vals):
+            return initialize_model(jax.random.PRNGKey(seed), likelihood, init_strategy=init_to_value(values=vals),
+                                    model_kwargs=run_kwargs)[0].z         # unconstrained, as NUTS samples
+        z_random, z_warm = unconstrained(values), unconstrained(warm_values)
+
+        sigma_range = (_interior(sigma_prior, float(sigma_prior.low)), _interior(sigma_prior, float(sigma_prior.high)))
+        x, tail = wall_clearance(burst, values, n_pulses, likelihood, likelihood_kwargs)
+        _, tail_warm = wall_clearance(burst, warm_values, n_pulses, likelihood, likelihood_kwargs)
+        kept_times = np.array([_interior(time_prior, float(v))
+                               for v in np.asarray(warm_start["params"][time_param]).reshape(-1)])
+        init_times, init_sigma = box_times(
+            burst, warm_start["M_FD"], warm_start["result"], n_pulses, num_chains, n_warm, time_prior,
+            sigma_range, seed, clearance=(x, np.where(np.arange(num_chains) < n_warm, tail_warm, tail)),
+            fixed=(kept_times, np.asarray(warm_values["sigma"])[: n_pulses - 1]))
+
+        # Each chain's own start. With ordered times the pulses are put in time order, every
+        # per-pulse parameter moving with its pulse; otherwise the order is left as it is.
+        name = f"{time_param}_base" if ordered_times and n_pulses > 1 else time_param
+        per_chain = []
+        for c in range(num_chains):
+            z = dict(z_warm if c < n_warm else z_random)
+            order = np.argsort(init_times[c]) if name != time_param else np.arange(n_pulses)
+            init_times[c], init_sigma[c] = init_times[c][order], init_sigma[c][order]
+            z = {key: (v[order] if jnp.shape(v) == (n_pulses,) else v) for key, v in z.items()}
+            z[name] = biject_to(time_prior.support).inv(jnp.asarray(init_times[c], dtype=jnp.float32))
+            z["sigma"] = biject_to(sigma_prior.support).inv(jnp.asarray(init_sigma[c], dtype=jnp.float32))
+            per_chain.append(z)
+        init_params = {key: jnp.stack([z[key] for z in per_chain]) for key in per_chain[0]}
+        if num_chains == 1:
+            init_params = {key: v[0] for key, v in init_params.items()}
+
+    mcmc.run(jax.random.PRNGKey(seed), extra_fields=extra_fields, init_params=init_params, **run_kwargs)
+
+    mcmc.init_times = init_times      # warm-started runs only (None otherwise)
+    mcmc.init_sigma = init_sigma
     mcmc.seed = seed                  # the seed actually used; save_run records it
     mcmc.priors = dict(priors)                          # as passed in (a marginalized fit keeps A_snr here)
     mcmc.n_pulses = n_pulses
@@ -562,6 +793,145 @@ def run_fit(
                               "shared_params": shared_params, "ordered_times": ordered_times}
 
     return mcmc
+
+
+# ---- Finding the number of pulses ----
+
+def iterative_pulse_fit(
+    burst,
+    single_pulse_fn: Callable,
+    likelihood: Callable = FD_gaussianlikelihood,
+    snr_min: float = 8.0,
+    n_max: int = 5,
+    num_chains: int = 64,
+    n_warm_chains: int = None,
+    warm_start_tau: bool = False,
+    s_opt: float = 100.0,
+    seed: int = None,
+    epsilon: float = 0.2,
+    p_false_alarm: float = 0.01,
+    plot_steps: bool = False,
+    verbose: bool = True,
+    prior_kwargs: dict = None,
+    **run_kwargs,
+) -> dict:
+    """
+    Fits 1, 2, ... pulses, adding one at a time while the data call for it, and returns every fit
+    and the number of pulses kept.
+
+    Each step from n - 1 to n pulses:
+      1. excess_power_search of the (n - 1)-pulse fit's residual. If nothing is significant, stop.
+      2. Fit n pulses (run_fit): n_warm_chains chains start from the (n - 1)-pulse fit's maximum a
+         posteriori draw plus one new pulse in a flagged residual box, the rest from scratch.
+      3. Accept the n-pulse fit only if it explains at least one flagged box (boxes_explained) AND
+         its ELPD exceeds the previous fit's by at least snr_min^2 / 2. Otherwise stop.
+    Each fit pools chains that sampled the same mode and weights distinct modes by their peak
+    posterior (combine_chains); its maximum a posteriori draw gives the model whose residual the
+    next step searches.
+
+    ONE DETECTION THRESHOLD. snr_min sets all three thresholds, so they speak the same language: a
+    flagged box must hold leftover signal of at least this SNR (beyond noise and the tolerated
+    model error), a new pulse must change the model by at least this SNR inside a box for it to
+    count as explained, and the ELPD must rise by at least snr_min^2 / 2, the log-likelihood gain of
+    fitting a pulse of SNR snr_min. The default 8 is the usual single-detector threshold of
+    gravitational-wave searches.
+
+    burst, single_pulse_fn: as for set_priors and run_fit
+    likelihood:     the unmarginalized likelihood (FD_gaussianlikelihood); the residual model is
+                    built from the sampled fluences, which the marginalized likelihoods do not sample
+    snr_min:        the detection SNR above
+    n_max:          largest number of pulses tried
+    num_chains:     chains per fit
+    n_warm_chains:  chains warm-started from the previous fit (None: half of num_chains)
+    warm_start_tau: passed to run_fit: True lets warm chains inherit the previous fit's tau_ref
+    s_opt:          scale of the A_snr prior (set_priors)
+    seed:           one seed for every fit; None draws one, printed by run_fit
+    epsilon, p_false_alarm: passed to excess_power_search (tolerated model error, false-alarm
+                    probability of the whole search)
+    plot_steps:     draw plotting.plot_boxes_explained for every step tried
+    verbose:        print each step's priors, chain grouping, search and decision
+    prior_kwargs:   further arguments to set_priors (e.g. shrink_sigma_npulses, overrides)
+    run_kwargs:     further arguments to run_fit and the likelihood (e.g. num_warmup, repulsion={})
+
+    Returns a dict:
+      'n_pulses'   the number of pulses kept
+      'fit'        the kept fit, as fits[n_pulses]
+      'fits'       {n: fit} for every number of pulses fitted, each a dict with 'mcmc', 'priors',
+                   'post' (pooled posterior draws), 'info' (from combine_chains), 'map' (maximum a
+                   posteriori draw), 'M' (its model) and 'elpd'
+      'steps'      one dict per step tried: n, 'search' (excess_power_search result), and, when an
+                   n-pulse fit was run, 'check' (boxes_explained result), 'd_elpd' and 'accept'
+      'stop'       why the search stopped
+      'snr_min', 'elpd_min', 'min_channels', 'seed'
+    """
+    from postprocess import (pointwise_log_lik, combine_chains, _loo_by_observation,
+                             excess_power_search, boxes_explained, min_box_channels)
+    from plotting import model_from_draw, plot_boxes_explained
+
+    if likelihood not in UNMARGINALIZED:
+        raise ValueError("iterative_pulse_fit needs an unmarginalized likelihood, whose samples carry the fluence.")
+    prior_kwargs = dict(prior_kwargs or {})
+    if seed is None:
+        seed = int(np.random.default_rng().integers(2**31 - 1))
+    if n_warm_chains is None:
+        n_warm_chains = num_chains // 2
+    elpd_min = snr_min ** 2 / 2.0
+
+    # narrowest band one pulse can occupy under the spectral prior: the fewest channels a box may span
+    min_channels = min_box_channels(burst, set_priors(burst, single_pulse_fn, 1, s_opt=s_opt,
+                                                      verbose=False, **prior_kwargs))
+    if verbose:
+        print(f"iterative_pulse_fit: snr_min {snr_min:g} (delta ELPD threshold {elpd_min:g}), "
+              f"minimum box width {min_channels} channels, up to {n_max} pulses")
+
+    def fit(n, ep=None, prev=None):
+        priors = set_priors(burst, single_pulse_fn, n, s_opt=s_opt, verbose=verbose, **prior_kwargs)
+        warm = {} if ep is None else dict(warm_start=dict(params=prev["map"], result=ep, M_FD=prev["M"]),
+                                          n_warm_chains=n_warm_chains, warm_start_tau=warm_start_tau)
+        mcmc = run_fit(burst, single_pulse_fn, priors, likelihood, n_pulses=n, num_chains=num_chains,
+                       seed=seed, **warm, **run_kwargs)
+        s = {k: np.asarray(v) for k, v in mcmc.get_samples(group_by_chain=True).items()}
+        U = np.asarray(mcmc.get_extra_fields(group_by_chain=True)["potential_energy"])
+        ll = pointwise_log_lik(burst, single_pulse_fn, s, thin=1)
+        post, info = combine_chains(s, ll, U, verbose=verbose)
+        ll_post = ll[info["chain"], info["draw"]]
+        best = int(np.argmax(-U[info["chain"], info["draw"]]))        # maximum a posteriori draw
+        M, _ = model_from_draw(single_pulse_fn, post, best)
+        return dict(mcmc=mcmc, priors=priors, post=post, info=info, M=np.asarray(M),
+                    map={k: np.asarray(v)[best] for k, v in post.items()},
+                    elpd=float(_loo_by_observation(ll_post)[0].sum()))
+
+    fits, steps = {1: fit(1)}, []
+    n_final, stop = 1, f"reached n_max = {n_max}"
+    for n in range(2, n_max + 1):
+        ep = excess_power_search(burst, fits[n - 1]["M"], epsilon=epsilon, min_snr=snr_min,
+                                 p_false_alarm=p_false_alarm, min_channels=min_channels, verbose=verbose)
+        if not ep["add_pulse"]:
+            steps.append(dict(n=n, search=ep))
+            stop = "no significant leftover signal"
+            break
+        fits[n] = fit(n, ep, fits[n - 1])
+        check = boxes_explained(burst, fits[n - 1]["M"], fits[n]["M"], ep, min_change_snr=snr_min,
+                                verbose=verbose)
+        if plot_steps:
+            plot_boxes_explained(burst, fits[n - 1]["M"], fits[n]["M"], check)
+        d_elpd = fits[n]["elpd"] - fits[n - 1]["elpd"]
+        accept = bool(check["any_removed"] and d_elpd >= elpd_min)
+        steps.append(dict(n=n, search=ep, check=check, d_elpd=d_elpd, accept=accept))
+        if verbose:
+            print(f"{n - 1} -> {n} pulses: delta ELPD = {d_elpd:.1f} (need {elpd_min:.1f}), explains "
+                  f"leftover signal: {check['any_removed']} -> {'accept' if accept else 'reject'}")
+        if not accept:
+            reasons = ([] if check["any_removed"] else ["it explains no flagged leftover signal"]) + \
+                      ([] if d_elpd >= elpd_min else [f"delta ELPD {d_elpd:.1f} < {elpd_min:g}"])
+            stop = f"{n}-pulse fit rejected: " + " and ".join(reasons)
+            break
+        n_final = n
+
+    if verbose:
+        print(f"final: {n_final} pulses ({stop})")
+    return dict(n_pulses=n_final, fit=fits[n_final], fits=fits, steps=steps, stop=stop,
+                snr_min=snr_min, elpd_min=elpd_min, min_channels=min_channels, seed=seed)
 
 
 # -------------------------------------------------------------------
