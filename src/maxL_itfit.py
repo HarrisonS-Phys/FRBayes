@@ -9,9 +9,10 @@ optimizers instead of NUTS:
                 parameters, through the same transforms NUTS samples in; their densities and the
                 transform Jacobians are left out, so the maximum does not depend on the
                 parameterization.
-    starts:     the same as run_fit's chains: n_warm warm starts (the previous fit's best point,
-                tau_ref reset unless warm_start_tau, plus a new pulse in a flagged box) and the
-                rest random. With one pulse, every start is random (default_init).
+    starts:     the same as run_fit's chains (run.warm_start_points): n_warm warm starts (the
+                previous fit's best point, tau_ref and delta reset, plus a new pulse in a flagged box,
+                or with split_starts one old pulse split in two) and the rest random. With one
+                pulse, every start is random (default_init).
     optimizer:  Adam on the unconstrained parameters (n_adam steps, step size decaying
                 geometrically from lr to lr * lr_decay), then BFGS (jax.scipy.optimize.minimize,
                 at most n_bfgs iterations); a BFGS result is kept only where it improved on Adam's.
@@ -53,8 +54,7 @@ from numpyro.infer import init_to_value
 from numpyro.infer.util import constrain_fn, initialize_model
 
 from likelihood import FD_gaussianlikelihood
-from run import (set_priors, run_fit, default_init, _starting_values, _previous_fit_values,
-                 wall_clearance, box_times, _interior)
+from run import set_priors, run_fit, default_init, warm_start_points, _interior, _announce_delta_init
 
 # the factor sites that are maximized: the fit, and the repulsion prior between active pulses
 OBJECTIVE_SITES = ("log_likelihood", "repulsive_toa_prior")
@@ -64,51 +64,25 @@ TAU_SITE = "tau_ref_shared"          # the shared scattering time, the site prof
 def _model_kwargs(burst, single_pulse_fn, priors, n_pulses, shared_params, likelihood_kwargs):
     """The likelihood's arguments, as run_fit builds them for an unmarginalized fit."""
     return dict(data_fd=burst.data_fd, sigma_noise_fd=burst.sigma_noise_fd, n_pulses=n_pulses,
-                priors=priors, single_pulse_fn=single_pulse_fn,
-                spectral_coeff_map=burst.spectral_coeff_map if "c1" in priors else None,
-                shared_params=shared_params, ordered_times=False, **likelihood_kwargs)
+                priors=priors, single_pulse_fn=single_pulse_fn, shared_params=shared_params,
+                **likelihood_kwargs)
 
 
-def _starts(burst, priors, likelihood, n_pulses, num_starts, n_warm, model_kwargs, likelihood_kwargs,
-            seed, prev=None, search=None, warm_start_tau=False):
+def _starts(burst, single_pulse_fn, priors, likelihood, n_pulses, num_starts, n_warm, model_kwargs,
+            likelihood_kwargs, seed, prev=None, search=None, split_starts=True):
     """
     Unconstrained starting points, a dict of arrays with leading axis num_starts: the same starts
-    run_fit would give its chains (see run_fit's warm_start). Without `prev`, every start is
-    random (default_init with random arrival times).
+    run_fit would give its chains (run.warm_start_points). Without `prev`, every start is random
+    (default_init with random arrival times).
     """
     if prev is None:
         keys = jax.random.split(jax.random.PRNGKey(seed), num_starts)
         info = initialize_model(keys, likelihood, init_strategy=default_init(burst, priors, n_pulses),
                                 model_kwargs=model_kwargs)[0]
         return info.z, None, None
-
-    time_param = "mean_arrival_time"
-    time_prior, sigma_prior = priors[time_param], priors["sigma"]
-    values, _ = _starting_values(burst, priors, n_pulses)                               # random starts
-    warm_values = _previous_fit_values(prev["map"], values, priors, n_pulses,
-                                       reset=() if warm_start_tau else ("tau_ref",))   # warm starts
-
-    def unconstrained(vals):
-        return initialize_model(jax.random.PRNGKey(seed), likelihood, init_strategy=init_to_value(values=vals),
-                                model_kwargs=model_kwargs)[0].z
-    z_random, z_warm = unconstrained(values), unconstrained(warm_values)
-
-    sigma_range = (_interior(sigma_prior, float(sigma_prior.low)), _interior(sigma_prior, float(sigma_prior.high)))
-    x, tail = wall_clearance(burst, values, n_pulses, likelihood, likelihood_kwargs)
-    _, tail_warm = wall_clearance(burst, warm_values, n_pulses, likelihood, likelihood_kwargs)
-    kept_times = np.array([_interior(time_prior, float(v)) for v in np.asarray(prev["map"][time_param]).reshape(-1)])
-    init_times, init_sigma = box_times(
-        burst, prev["M"], search, n_pulses, num_starts, n_warm, time_prior, sigma_range, seed,
-        clearance=(x, np.where(np.arange(num_starts) < n_warm, tail_warm, tail)),
-        fixed=(kept_times, np.asarray(warm_values["sigma"])[: n_pulses - 1]))
-
-    per_start = []
-    for c in range(num_starts):
-        z = dict(z_warm if c < n_warm else z_random)
-        z[time_param] = biject_to(time_prior.support).inv(jnp.asarray(init_times[c], dtype=jnp.float32))
-        z["sigma"] = biject_to(sigma_prior.support).inv(jnp.asarray(init_sigma[c], dtype=jnp.float32))
-        per_start.append(z)
-    return {k: jnp.stack([z[k] for z in per_start]) for k in per_start[0]}, init_times, init_sigma
+    return warm_start_points(burst, single_pulse_fn, priors, likelihood, model_kwargs, likelihood_kwargs,
+                             prev["map"], prev["M"], search, n_pulses, num_starts, n_warm, seed,
+                             split_starts=split_starts)
 
 
 def _adam(f, n_steps, lr, lr_decay):
@@ -129,9 +103,10 @@ def _adam(f, n_steps, lr, lr_decay):
 def _bfgs(f, n_iter):
     """
     BFGS from x, kept only if it improved. The objective is re-evaluated at BFGS's returned point
-    rather than trusting its reported value: vmapped over starts, jax.scipy.optimize.minimize can
-    return a point whose objective differs from the value it reports (seen in testing, by
-    hundreds of nats).
+    rather than trusting its reported value: in float32 almost every run of
+    jax.scipy.optimize.minimize ends with a failed line search (status 3), and a few return a point
+    where the objective is infinite while reporting the last finite value (2 of 32 starts in a
+    test, with or without vmap). Such points are rejected and the starting point is kept.
     """
     def run(x, fx):
         if n_iter <= 0:
@@ -144,7 +119,7 @@ def _bfgs(f, n_iter):
 
 
 def maxL_fit(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlikelihood, num_starts=64,
-             n_warm=None, prev=None, search=None, warm_start_tau=False, shared_params=("DM", "tau_ref"),
+             n_warm=None, prev=None, search=None, split_starts=True, shared_params=("DM", "tau_ref"),
              n_adam=2000, lr=0.05, lr_decay=0.01, n_bfgs=500, tau_profile=0, n_polish=500, lr_polish=0.01,
              tau_floor=0.1, tau_zero=1e-3, tau_parallel=False, seed=0, verbose=True, **likelihood_kwargs):
     """
@@ -152,6 +127,7 @@ def maxL_fit(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlik
     docstring). prev: the previous fit (with 'map' and 'M') and search: the excess_power_search
     of its residual, for warm starts; both None for random starts only.
 
+    split_starts: let some warm starts split one old pulse in two (run.warm_start_points)
     tau_profile:  0 (default) optimizes everything at once from each start. n_tau > 0 runs every
                   start at each pinned value of tau_ref first (module docstring), with n_polish
                   Adam steps at lr_polish after releasing it.
@@ -173,8 +149,12 @@ def maxL_fit(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlik
     t_start = time.time()
     n_warm = num_starts // 2 if n_warm is None else n_warm
     model_kwargs = _model_kwargs(burst, single_pulse_fn, priors, n_pulses, shared_params, likelihood_kwargs)
-    z0, init_times, init_sigma = _starts(burst, priors, likelihood, n_pulses, num_starts, n_warm, model_kwargs,
-                                         likelihood_kwargs, seed, prev, search, warm_start_tau)
+    if verbose:
+        amplitude = "fluence in units of SNR as A_snr" if "A_snr" in priors else "fluence as A"
+        print(f"maxL_fit: likelihood {getattr(likelihood, '__name__', likelihood)}, parameterizing {amplitude}")
+        _announce_delta_init(priors, warm=prev is not None)
+    z0, init_times, init_sigma = _starts(burst, single_pulse_fn, priors, likelihood, n_pulses, num_starts, n_warm,
+                                         model_kwargs, likelihood_kwargs, seed, prev, search, split_starts)
 
     def trace_at(z):
         params = constrain_fn(likelihood, (), model_kwargs, z)
@@ -279,7 +259,7 @@ def log_l_at(burst, single_pulse_fn, priors, n_pulses, params, likelihood=FD_gau
 
 
 def maxL_iterative_pulse_fit(burst, single_pulse_fn, likelihood=FD_gaussianlikelihood, snr_min=8.0, n_max=5,
-                             num_starts=64, n_warm=None, warm_start_tau=False, s_opt=100.0, seed=None,
+                             num_starts=64, n_warm=None, split_starts=True, s_opt=100.0, seed=None,
                              epsilon=0.2, p_false_alarm=0.01, plot_steps=False, verbose=True, prior_kwargs=None,
                              shared_params=("DM", "tau_ref"), final_nuts=False, nuts_kwargs=None,
                              n_adam=2000, lr=0.05, lr_decay=0.01, n_bfgs=500, tau_profile=0, n_polish=500,
@@ -287,7 +267,7 @@ def maxL_iterative_pulse_fit(burst, single_pulse_fn, likelihood=FD_gaussianlikel
     """
     run.iterative_pulse_fit with maximum-likelihood fits at every step (module docstring).
 
-    tau_profile, n_polish, lr_polish, tau_floor, tau_zero, tau_parallel: passed to maxL_fit
+    split_starts, tau_profile, n_polish, lr_polish, tau_floor, tau_zero, tau_parallel: passed to maxL_fit
                  (tau_profile = 0: no tau profile)
     final_nuts:  also run NUTS (run.run_fit) on the kept number of pulses, every chain started at
                  the best point, with nuts_kwargs (e.g. num_chains, num_warmup) passed to run_fit
@@ -305,7 +285,7 @@ def maxL_iterative_pulse_fit(burst, single_pulse_fn, likelihood=FD_gaussianlikel
     if seed is None:
         seed = int(np.random.default_rng().integers(2**31 - 1))
     n_warm = num_starts // 2 if n_warm is None else n_warm
-    priors1 = set_priors(burst, single_pulse_fn, 1, s_opt=s_opt, verbose=False, **prior_kwargs)
+    priors1 = set_priors(burst, single_pulse_fn, s_opt=s_opt, verbose=False, **prior_kwargs)
     k_new = sum(1 for name in priors1 if name not in shared_params)        # parameters a new pulse adds
     logL_min = snr_min ** 2 / 2.0 + k_new
     min_channels = min_box_channels(burst, priors1)
@@ -317,9 +297,9 @@ def maxL_iterative_pulse_fit(burst, single_pulse_fn, likelihood=FD_gaussianlikel
                  + (f" plus {tau_zero:g} dt" if tau_zero is not None else "") if tau_profile else ""))
 
     def fit(n, prev=None, search=None):
-        priors = set_priors(burst, single_pulse_fn, n, s_opt=s_opt, verbose=False, **prior_kwargs)
+        priors = set_priors(burst, single_pulse_fn, s_opt=s_opt, verbose=False, **prior_kwargs)
         return maxL_fit(burst, single_pulse_fn, priors, n, likelihood=likelihood, num_starts=num_starts,
-                        n_warm=n_warm, prev=prev, search=search, warm_start_tau=warm_start_tau,
+                        n_warm=n_warm, prev=prev, search=search, split_starts=split_starts,
                         shared_params=shared_params, n_adam=n_adam, lr=lr, lr_decay=lr_decay, n_bfgs=n_bfgs,
                         tau_profile=tau_profile, n_polish=n_polish, lr_polish=lr_polish, tau_floor=tau_floor,
                         tau_zero=tau_zero, tau_parallel=tau_parallel,

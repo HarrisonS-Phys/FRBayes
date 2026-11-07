@@ -379,6 +379,118 @@ def box_times(burst, M_FD, result, n_pulses, num_chains, n_warm_chains, time_pri
     return times, sigmas
 
 
+def _split_values(warm_values, priors, n_pulses, k, d):
+    """
+    Starting values for a SPLIT start: the warm values with old pulse k replaced by two halves, one in
+    its own slot and one in the new pulse's (the last): times t_k - d and t_k + d, each with width
+    sigma_k / 2 and amplitude A_snr_k / sqrt(2) (or fluence A_k / 2), so their total SNR (or fluence)
+    is pulse k's, and pulse k's other values. Every value is moved just inside its prior's bounds.
+
+    warm_values: starting values from _previous_fit_values (the previous fit's pulses, then the new pulse)
+    priors:      the priors of the new fit
+    n_pulses:    number of pulses in the new fit
+    k:           index of the old pulse to split
+    d:           half the separation of the two halves (s)
+    """
+    new = n_pulses - 1
+    values = {}
+    for name, v in warm_values.items():
+        v = np.array(v, dtype=float)
+        if v.shape == (n_pulses,):
+            v[new] = v[k]                                   # the second half starts as a copy of pulse k
+        values[name] = v
+    t_k = values["mean_arrival_time"][k]
+    values["mean_arrival_time"][[k, new]] = [t_k - d, t_k + d]
+    values["sigma"][[k, new]] = 0.5 * values["sigma"][k]
+    if "A_snr" in values:
+        values["A_snr"][[k, new]] = values["A_snr"][k] / np.sqrt(2.0)
+    if "A" in values:
+        values["A"][[k, new]] = 0.5 * values["A"][k]
+    for name, v in values.items():
+        if name in priors and v.shape == (n_pulses,):
+            values[name] = np.array([_interior(priors[name], float(u)) for u in v])
+    return {name: jnp.asarray(v, dtype=jnp.float32) for name, v in values.items()}
+
+
+def warm_start_points(burst, single_pulse_fn, priors, likelihood, model_kwargs, likelihood_kwargs, prev_params,
+                      prev_M, search, n_pulses, n_starts, n_warm, seed, reset=("tau_ref",), split_starts=True):
+    """
+    Starting points for a fit with one more pulse than a previous fit, shared by NUTS (run_fit) and
+    the maximum-likelihood search (maxL_fit). The first n_warm start from the previous fit
+    (_previous_fit_values) with the new pulse in a flagged residual box (box_times); with
+    split_starts, the last of those instead split one old pulse in two (_split_values), widest old
+    pulse first, one per old pulse up to half the warm starts, which gives a start that can separate
+    two close pulses the previous fit covered with one wide pulse. The rest start from scratch
+    (_starting_values) at random times and widths. Pulses start clear of each other's repulsion wall
+    where the window has room (wall_clearance). Returns (z, init_times, init_sigma): the starting
+    points on the unconstrained scale NUTS and the optimizers work on, a dict of arrays with leading
+    axis n_starts, and the starting arrival times and widths, each (n_starts, n_pulses).
+
+    burst:             the ConditionedData of the burst
+    single_pulse_fn:   the model closure from model.setup_model
+    priors:            the priors of the new fit (set_priors)
+    likelihood:        the NumPyro model
+    model_kwargs:      the likelihood's arguments for the new fit, to map starting values to the unconstrained scale
+    likelihood_kwargs: the keyword arguments the likelihood is given (e.g. repulsion={...}), for wall_clearance
+    prev_params:       the previous fit's best point, name -> value, n_pulses - 1 pulses
+    prev_M:            the previous fit's model on the retained Fourier bins
+    search:            postprocess.excess_power_search of the previous fit's residual
+    n_pulses:          number of pulses in the new fit
+    n_starts:          number of starts (chains or optimizer starts)
+    n_warm:            how many of them start from the previous fit
+    seed:              integer the random placements are drawn from
+    reset:             parameters the warm starts restart from their defaults instead of inheriting (delta always is)
+    split_starts:      turn some warm starts into split starts
+    """
+    time_param = "mean_arrival_time"
+    time_prior, sigma_prior = priors[time_param], priors.get("sigma")
+    if getattr(sigma_prior, "high", None) is None:
+        raise ValueError("warm starts draw a width per pulse: they need a bounded 'sigma' prior.")
+    values = _starting_values(burst, priors, n_pulses)                                    # random starts
+    warm_values = _previous_fit_values(prev_params, values, priors, n_pulses, reset=reset)  # warm starts
+
+    def unconstrained(vals):
+        """The starting values on the unconstrained scale NUTS and the optimizers work on."""
+        return initialize_model(jax.random.PRNGKey(seed), likelihood, init_strategy=init_to_value(values=vals),
+                                model_kwargs=model_kwargs)[0].z
+    z_random, z_warm = unconstrained(values), unconstrained(warm_values)
+
+    sigma_range = (_interior(sigma_prior, float(sigma_prior.low)), _interior(sigma_prior, float(sigma_prior.high)))
+    x, tail = wall_clearance(burst, single_pulse_fn, priors, values, n_pulses, likelihood, likelihood_kwargs)
+    _, tail_warm = wall_clearance(burst, single_pulse_fn, priors, warm_values, n_pulses, likelihood, likelihood_kwargs)
+    kept_times = np.array([_interior(time_prior, float(v)) for v in np.asarray(prev_params[time_param]).reshape(-1)])
+    init_times, init_sigma = box_times(
+        burst, prev_M, search, n_pulses, n_starts, n_warm, time_prior, sigma_range, seed,
+        clearance=(x, np.where(np.arange(n_starts) < n_warm, tail_warm, tail)),
+        fixed=(kept_times, np.asarray(warm_values["sigma"])[: n_pulses - 1]))
+
+    # Split starts: the last warm starts, each splitting one old pulse, widest first
+    splits = {}
+    if split_starts:
+        n_split = min(n_pulses - 1, n_warm // 2)
+        widest = np.argsort(-np.asarray(warm_values["sigma"])[: n_pulses - 1])[:n_split]
+        splits = {n_warm - n_split + i: int(k) for i, k in enumerate(widest)}
+
+    # Each start's own point: its warm, split or random values, with its own arrival times and widths
+    per_start = []
+    for c in range(n_starts):
+        if c in splits:
+            k = splits[c]
+            half_width = np.sqrt((0.5 * float(np.asarray(warm_values["sigma"])[k])) ** 2 + float(tail_warm) ** 2)
+            vals = _split_values(warm_values, priors, n_pulses, k, d=max(x, 1.0) * half_width)
+            init_times[c], init_sigma[c] = np.asarray(vals[time_param]), np.asarray(vals["sigma"])
+            z = dict(unconstrained(vals))
+        else:
+            z = dict(z_warm if c < n_warm else z_random)
+        z[time_param] = biject_to(time_prior.support).inv(jnp.asarray(init_times[c], dtype=jnp.float32))
+        z["sigma"] = biject_to(sigma_prior.support).inv(jnp.asarray(init_sigma[c], dtype=jnp.float32))
+        per_start.append(z)
+    if splits:
+        print(f"split starts: {len(splits)} warm start(s) each split one of the previous fit's pulses in two "
+              f"(pulses {sorted(splits.values())})")
+    return {key: jnp.stack([z[key] for z in per_start]) for key in per_start[0]}, init_times, init_sigma
+
+
 # -------------------------------------------------------------------
 # 3. Sampling
 # -------------------------------------------------------------------
@@ -404,6 +516,7 @@ def run_fit(
     warm_start: dict = None,
     n_warm_chains: int = None,
     warm_start_tau: bool = False,
+    split_starts: bool = True,
     **likelihood_kwargs,
 ) -> MCMC:
     """
@@ -430,9 +543,10 @@ def run_fit(
     shared_params:      parameters sampled once for the whole burst (as '<name>_shared'); () keeps every parameter per pulse
     extra_fields:       per-draw sampler quantities kept beside the samples, read with mcmc.get_extra_fields()
     target_accept_prob: mean acceptance probability the step size is tuned for; higher gives smaller steps and fewer divergences
-    warm_start:         dict(params=..., result=..., M_FD=...): the previous fit's maximum a posteriori draw (n_pulses - 1 pulses), its model, and an excess_power_search of its residual; see box_times for how chains are started from it
+    warm_start:         dict(params=..., result=..., M_FD=...): the previous fit's maximum a posteriori draw (n_pulses - 1 pulses), its model, and an excess_power_search of its residual; see warm_start_points for how chains are started from it
     n_warm_chains:      how many chains start warm; None for all of them
     warm_start_tau:     let warm chains inherit the previous fit's tau_ref instead of restarting it at 0.5 dt
+    split_starts:       let some warm chains start with one of the previous fit's pulses split in two (warm_start_points)
     likelihood_kwargs:  passed straight to the likelihood, e.g. repulsion={...}
     """
     unknown = set(shared_params) - priors.keys()
@@ -480,42 +594,16 @@ def run_fit(
         **likelihood_kwargs,
     )
 
-    # WARM START: warm chains from the previous fit plus one new pulse, the rest from scratch
+    # WARM START: warm chains from the previous fit plus one new pulse (or a split pulse), the rest from scratch
     init_params, init_times, init_sigma = None, None, None
     if warm_start is not None:
-        time_param = "mean_arrival_time"
-        time_prior, sigma_prior = priors[time_param], priors.get("sigma")
-        if getattr(sigma_prior, "high", None) is None or "sigma" in shared_params:
-            raise ValueError("warm_start draws a width per pulse: it needs a bounded 'sigma' prior, not shared.")
+        if "sigma" in shared_params:
+            raise ValueError("warm_start draws a width per pulse, so 'sigma' cannot be shared.")
         n_warm = num_chains if n_warm_chains is None else n_warm_chains
-        values = _starting_values(burst, priors, n_pulses)                                  # random chains
-        warm_values = _previous_fit_values(warm_start["params"], values, priors, n_pulses,
-                                           reset=() if warm_start_tau else ("tau_ref",))   # warm chains
-
-        def unconstrained(vals):
-            """The starting values on the unconstrained scale NUTS samples on."""
-            return initialize_model(jax.random.PRNGKey(seed), likelihood, init_strategy=init_to_value(values=vals),
-                                    model_kwargs=run_kwargs)[0].z
-        z_random, z_warm = unconstrained(values), unconstrained(warm_values)
-
-        sigma_range = (_interior(sigma_prior, float(sigma_prior.low)), _interior(sigma_prior, float(sigma_prior.high)))
-        x, tail = wall_clearance(burst, single_pulse_fn, priors, values, n_pulses, likelihood, likelihood_kwargs)
-        _, tail_warm = wall_clearance(burst, single_pulse_fn, priors, warm_values, n_pulses, likelihood, likelihood_kwargs)
-        kept_times = np.array([_interior(time_prior, float(v))
-                               for v in np.asarray(warm_start["params"][time_param]).reshape(-1)])
-        init_times, init_sigma = box_times(
-            burst, warm_start["M_FD"], warm_start["result"], n_pulses, num_chains, n_warm, time_prior,
-            sigma_range, seed, clearance=(x, np.where(np.arange(num_chains) < n_warm, tail_warm, tail)),
-            fixed=(kept_times, np.asarray(warm_values["sigma"])[: n_pulses - 1]))
-
-        # Each chain's own start: its warm or random values, with its own arrival times and widths
-        per_chain = []
-        for c in range(num_chains):
-            z = dict(z_warm if c < n_warm else z_random)
-            z[time_param] = biject_to(time_prior.support).inv(jnp.asarray(init_times[c], dtype=jnp.float32))
-            z["sigma"] = biject_to(sigma_prior.support).inv(jnp.asarray(init_sigma[c], dtype=jnp.float32))
-            per_chain.append(z)
-        init_params = {key: jnp.stack([z[key] for z in per_chain]) for key in per_chain[0]}
+        init_params, init_times, init_sigma = warm_start_points(
+            burst, single_pulse_fn, priors, likelihood, run_kwargs, likelihood_kwargs, warm_start["params"],
+            warm_start["M_FD"], warm_start["result"], n_pulses, num_chains, n_warm, seed,
+            reset=() if warm_start_tau else ("tau_ref",), split_starts=split_starts)
         if num_chains == 1:
             init_params = {key: v[0] for key, v in init_params.items()}
 
@@ -560,7 +648,8 @@ def iterative_pulse_fit(
     Fits 1, 2, ... pulses with NUTS, adding one at a time while the data call for it. Each step from
     n - 1 to n pulses runs postprocess.excess_power_search on the (n - 1)-pulse fit's residual and
     stops if nothing is significant; otherwise fits n pulses (run_fit, half the chains warm-started
-    from the previous fit's maximum a posteriori draw plus a new pulse in a flagged box), and accepts
+    from the previous fit's maximum a posteriori draw plus a new pulse in a flagged box or one old
+    pulse split in two; see warm_start_points), and accepts
     the n-pulse fit only if it explains at least one flagged box (postprocess.boxes_explained) AND
     its ELPD rises by at least snr_min^2 / 2, the log-likelihood gain of a pulse of SNR snr_min.
     snr_min also sets the box significance and the model change that counts as explaining a box, so
