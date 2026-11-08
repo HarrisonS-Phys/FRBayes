@@ -14,19 +14,19 @@ optimizers instead of NUTS:
                 or with split_starts one old pulse split in two) and the rest random. With one
                 pulse, every start is random (default_init).
     optimizer:  Adam on the unconstrained parameters (n_adam steps, step size decaying
-                geometrically from lr to lr * lr_decay), then BFGS (jax.scipy.optimize.minimize,
-                at most n_bfgs iterations); a BFGS result is kept only where it improved on Adam's.
+                geometrically from lr to lr * lr_decay).
     tau profile (tau_profile = n_tau > 0): every start is run once for each value of the shared
                 scattering time on a grid: one effectively-zero value, tau_zero * dt (default
                 1e-3 dt, where the scattering factor is indistinguishable from 1; None to omit),
-                then n_tau values log-spaced from tau_floor * dt (default 0.1 dt) to the tau_ref
-                prior's upper bound. tau is measurable well below dt at high SNR (through the
+                then at least n_tau values log-spaced from tau_floor * dt (default 0.1 dt) to the
+                tau_ref prior's upper bound, more if needed so that neighbouring values are no
+                further apart than the polish can move tau_ref. tau is measurable well below dt at high SNR (through the
                 phase of the scattering transfer function and its nu^-4 frequency dependence), so
                 the log grid starts below one bin; 0 itself cannot be used, since it is -infinity
                 both on a log grid and in the transformed coordinates of the Uniform(0, tau_max)
                 prior. Each run first optimizes everything else with tau_ref held at its grid
                 value (n_adam Adam steps), then releases tau_ref and refines jointly (n_polish
-                Adam steps at step size lr_polish, then BFGS). The best run over all values and
+                Adam steps starting at step size lr_polish). The best run over all values and
                 starts is kept. Holding tau fixed first stops the optimizer from inflating the
                 scattering tail before the pulses have settled, the trap seen on 22310619_BB.
                 The best pinned ln L at each grid value is the profile likelihood in tau,
@@ -45,9 +45,8 @@ import time
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax.example_libraries import optimizers
+import optax
 from jax.flatten_util import ravel_pytree
-from jax.scipy.optimize import minimize
 from numpyro import handlers
 from numpyro.distributions.transforms import biject_to
 from numpyro.infer import init_to_value
@@ -86,41 +85,34 @@ def _starts(burst, single_pulse_fn, priors, likelihood, n_pulses, num_starts, n_
 
 
 def _adam(f, n_steps, lr, lr_decay):
-    """Adam on f from x, step size decaying geometrically from lr to lr * lr_decay; returns (x, f(x))."""
-    opt_init, opt_update, get_params = optimizers.adam(lambda i: lr * lr_decay ** (i / max(n_steps - 1, 1)))
+    """
+    Optax's Adam on f from x for n_steps steps, the step size decaying geometrically from lr to
+    lr * lr_decay; a non-finite gradient component is replaced by 0 so one bad step cannot poison
+    the run. Returns a function x -> (x_end, f(x_end)).
+
+    f:        objective to minimize, a function of the flat parameter vector
+    n_steps:  number of Adam steps
+    lr:       starting step size, on the unconstrained scale
+    lr_decay: final step size as a fraction of lr
+    """
+    opt = optax.adam(optax.exponential_decay(init_value=lr, transition_steps=max(n_steps - 1, 1),
+                                             decay_rate=lr_decay))
     grad_f = jax.grad(f)
 
     def run(x):
-        def step(state, i):
-            g = grad_f(get_params(state))
-            return opt_update(i, jnp.where(jnp.isfinite(g), g, 0.0), state), None
-        state, _ = jax.lax.scan(step, opt_init(x), jnp.arange(n_steps))
-        x = get_params(state)
+        def step(carry, _):
+            x, state = carry
+            g = grad_f(x)
+            updates, state = opt.update(jnp.where(jnp.isfinite(g), g, 0.0), state, x)
+            return (optax.apply_updates(x, updates), state), None
+        (x, _), _ = jax.lax.scan(step, (x, opt.init(x)), None, length=n_steps)
         return x, f(x)
-    return run
-
-
-def _bfgs(f, n_iter):
-    """
-    BFGS from x, kept only if it improved. The objective is re-evaluated at BFGS's returned point
-    rather than trusting its reported value: in float32 almost every run of
-    jax.scipy.optimize.minimize ends with a failed line search (status 3), and a few return a point
-    where the objective is infinite while reporting the last finite value (2 of 32 starts in a
-    test, with or without vmap). Such points are rejected and the starting point is kept.
-    """
-    def run(x, fx):
-        if n_iter <= 0:
-            return x, fx
-        x_new = minimize(f, x, method="BFGS", options=dict(maxiter=n_iter)).x
-        f_new = f(x_new)
-        better = jnp.isfinite(f_new) & (f_new < fx)
-        return jnp.where(better, x_new, x), jnp.where(better, f_new, fx)
     return run
 
 
 def maxL_fit(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlikelihood, num_starts=64,
              n_warm=None, prev=None, search=None, split_starts=True, shared_params=("DM", "tau_ref"),
-             n_adam=2000, lr=0.05, lr_decay=0.01, n_bfgs=500, tau_profile=0, n_polish=500, lr_polish=0.01,
+             n_adam=2000, lr=0.05, lr_decay=0.01, tau_profile=0, n_polish=500, lr_polish=0.01,
              tau_floor=0.1, tau_zero=1e-3, tau_parallel=False, seed=0, verbose=True, **likelihood_kwargs):
     """
     Maximum-likelihood fit of n_pulses pulses from num_starts starting points (see the module
@@ -130,7 +122,8 @@ def maxL_fit(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlik
     split_starts: let some warm starts split one old pulse in two (run.warm_start_points)
     tau_profile:  0 (default) optimizes everything at once from each start. n_tau > 0 runs every
                   start at each pinned value of tau_ref first (module docstring), with n_polish
-                  Adam steps at lr_polish after releasing it.
+                  Adam steps at lr_polish after releasing it; n_tau is the fewest log-spaced values,
+                  raised for a burst whose range would otherwise leave gaps the polish cannot cross.
     tau_floor:    lower end of the log-spaced tau grid, in units of dt (default 0.1)
     tau_zero:     the effectively-zero tau value added below the log grid, in units of dt
                   (default 1e-3); None leaves it out
@@ -168,7 +161,6 @@ def maxL_fit(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlik
     _, unravel = ravel_pytree(z_one)
     f = lambda x: neg_log_l(unravel(x))
     x0 = jax.vmap(lambda z: ravel_pytree(z)[0])(z0)                                  # (num_starts, d)
-    bfgs = _bfgs(f, n_bfgs)
 
     if tau_profile:
         if TAU_SITE not in z_one:
@@ -179,7 +171,15 @@ def maxL_fit(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlik
         # coordinates) without clipping small values; the default 1e-3 would put the floor near 1 us
         tau_lo = _interior(tau_prior, float(tau_prior.low), margin=1e-6)
         tau_hi = _interior(tau_prior, float(tau_prior.high))
-        tau_grid = np.geomspace(max(tau_floor * dt, tau_lo), tau_hi, int(tau_profile))
+        # Neighbouring grid values no further apart than the polish can move tau_ref. Adam moves a
+        # parameter by at most about its step size per step, so the polish travels at most the sum of
+        # its step sizes on the unconstrained scale, where tau_ref well below its cap is ~ln tau_ref
+        tau_lo_log = max(tau_floor * dt, tau_lo)
+        reach = lr_polish * n_polish * ((1.0 - lr_decay) / np.log(1.0 / lr_decay) if lr_decay != 1.0 else 1.0)
+        n_log = int(tau_profile)
+        if reach > 0:
+            n_log = max(n_log, int(np.ceil(np.log(tau_hi / tau_lo_log) / reach)) + 1)
+        tau_grid = np.geomspace(tau_lo_log, tau_hi, n_log)
         if tau_zero is not None:
             tau_grid = np.concatenate([[max(tau_zero * dt, tau_lo)], tau_grid])
         tau_u = biject_to(tau_prior.support).inv(jnp.asarray(tau_grid, dtype=jnp.float32))
@@ -193,7 +193,6 @@ def maxL_fit(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlik
                 x, f_pinned = adam_pinned(x)
                 x = ravel_pytree(pin(unravel(x)))[0]               # start the release at the grid value
                 x, fx = adam_free(x)
-                x, fx = bfgs(x, fx)
                 return x, fx, f_pinned
             return jax.vmap(one)(x0)
 
@@ -206,7 +205,7 @@ def maxL_fit(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlik
         f_end = f_runs[best_tau, np.arange(num_starts)]
     else:
         adam = _adam(f, n_adam, lr, lr_decay)
-        x_end, f_end = jax.jit(jax.vmap(lambda x: bfgs(*adam(x))))(x0)
+        x_end, f_end = jax.jit(jax.vmap(adam))(x0)
         f_end = np.where(np.isfinite(np.asarray(f_end)), np.asarray(f_end), np.inf)
 
     # where every start ended: its sampled parameters, constrained (for diagnosing the optimizer)
@@ -262,7 +261,7 @@ def maxL_iterative_pulse_fit(burst, single_pulse_fn, likelihood=FD_gaussianlikel
                              num_starts=64, n_warm=None, split_starts=True, s_opt=100.0, seed=None,
                              epsilon=0.2, p_false_alarm=0.01, plot_steps=False, verbose=True, prior_kwargs=None,
                              shared_params=("DM", "tau_ref"), final_nuts=False, nuts_kwargs=None,
-                             n_adam=2000, lr=0.05, lr_decay=0.01, n_bfgs=500, tau_profile=0, n_polish=500,
+                             n_adam=2000, lr=0.05, lr_decay=0.01, tau_profile=0, n_polish=500,
                              lr_polish=0.01, tau_floor=0.1, tau_zero=1e-3, tau_parallel=False, **likelihood_kwargs):
     """
     run.iterative_pulse_fit with maximum-likelihood fits at every step (module docstring).
@@ -293,14 +292,14 @@ def maxL_iterative_pulse_fit(burst, single_pulse_fn, likelihood=FD_gaussianlikel
         print(f"maxL_iterative_pulse_fit: snr_min {snr_min:g}, accept a pulse if ln L rises by >= {logL_min:g} "
               f"(snr_min^2 / 2 + {k_new} parameters), minimum box width {min_channels} channels, "
               f"up to {n_max} pulses, seed {seed}"
-              + (f", tau profile over {tau_profile} values from {tau_floor:g} dt"
+              + (f", tau profile over at least {tau_profile} values from {tau_floor:g} dt"
                  + (f" plus {tau_zero:g} dt" if tau_zero is not None else "") if tau_profile else ""))
 
     def fit(n, prev=None, search=None):
         priors = set_priors(burst, single_pulse_fn, s_opt=s_opt, verbose=False, **prior_kwargs)
         return maxL_fit(burst, single_pulse_fn, priors, n, likelihood=likelihood, num_starts=num_starts,
                         n_warm=n_warm, prev=prev, search=search, split_starts=split_starts,
-                        shared_params=shared_params, n_adam=n_adam, lr=lr, lr_decay=lr_decay, n_bfgs=n_bfgs,
+                        shared_params=shared_params, n_adam=n_adam, lr=lr, lr_decay=lr_decay,
                         tau_profile=tau_profile, n_polish=n_polish, lr_polish=lr_polish, tau_floor=tau_floor,
                         tau_zero=tau_zero, tau_parallel=tau_parallel,
                         seed=seed, verbose=verbose, **likelihood_kwargs)
