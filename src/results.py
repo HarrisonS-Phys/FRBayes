@@ -1,10 +1,10 @@
 """
 results.py - Saving and loading fits of the FRB model.
 
-A saved run holds the posterior samples and everything needed to interpret them: the priors,
-the reference frequency, the orthogonal spectral basis, which likelihood was used, and a
-reference to the data. The DATA ITSELF IS NOT SAVED -- only an identifier, path and content
-hash, so a run can be traced back to its input and checked against it without duplicating
+A saved run holds the posterior samples and everything needed to interpret them: the priors, the
+reference frequency, the per-channel quantities the model was built from, which likelihood was
+used, and a reference to the data. The DATA ITSELF IS NOT SAVED -- only an identifier, path and
+content hash, so a run can be traced back to its input and checked against it without duplicating
 large files across the catalogue.
 """
 
@@ -18,20 +18,25 @@ import arviz as az
 
 
 def _fn_name(fn):
-    """Name of a function for the run record; netcdf attributes cannot hold the function itself."""
+    """
+    Name of a function for the run record; netcdf attributes cannot hold the function itself.
+
+    fn: the function, its name (model.setup_model stores the SED and pulse forms by name), or None
+    """
     if fn is None:
         return ""
-    if isinstance(fn, str):           # model.py stores the SED and pulse functions by name already
+    if isinstance(fn, str):
         return fn
     return getattr(fn, "__name__", type(fn).__name__)
 
 
 def describe_priors(priors):
     """
-    Serializable description of the priors, one string per parameter.
+    Serializable description of the priors, one string per parameter. NumPyro distributions have no
+    informative repr (it gives the object address), so each is described by its class name and its
+    own arguments, which is what has to be reproducible.
 
-    NumPyro distributions have no informative repr -- it gives the object address -- so each is
-    described by its class name and its own arguments, which is what has to be reproducible.
+    priors: the priors dict, as returned by run.set_priors
     """
     record = {}
     for name, d in priors.items():
@@ -42,13 +47,14 @@ def describe_priors(priors):
 
 def describe_data(path, event_id=None, n_bytes=None):
     """
-    Identifier, location and content hash of the analyzed file.
+    Identifier, location and content hash of the analyzed file. The hash is what makes the
+    reference meaningful: an event ID says which burst, but not which version of its data, and
+    reprocessing upstream changes the file without changing the name.
 
-    The hash is what makes the reference meaningful: an event ID says which burst, but not which
-    version of its data, and reprocessing upstream changes the file without changing the name.
-
-    n_bytes: hash only the first n_bytes of the file, for speed. None hashes all of it, which is
-             the safer default; a few hundred MB takes under a second.
+    path:     the file that was analyzed
+    event_id: identifier of the burst; None records an empty string
+    n_bytes:  hash only the first n_bytes of the file, for speed; None hashes all of it, the safer
+              default (a few hundred MB takes under a second)
     """
     path = Path(path)
     digest = hashlib.sha256()
@@ -63,43 +69,38 @@ def describe_data(path, event_id=None, n_bytes=None):
     }
 
 
-def save_run(path, mcmc, burst, priors, data_path, single_pulse_fn=None,
-             event_id=None, hash_bytes=None, extra_samples=None, dm_dedispersion=None,
-             dedispersion_ref_freq=None, **extra):
+def save_run(path, mcmc, burst, priors, single_pulse_fn=None, hash_bytes=None, extra_samples=None,
+             dm_dedispersion=None, dedispersion_ref_freq=None, **extra):
     """
-    Writes a fit to netcdf: posterior samples, plus the conditioning needed to interpret them.
+    Writes a fit to netcdf: the posterior samples, with the priors, the data reference (the burst's
+    event_id and data_path, and the file's content hash) and the model's scalar constants as
+    attributes, and the per-channel quantities the model was built from in the 'conditioning'
+    group. The reference frequency is recorded because gamma and tau_ref are defined relative to
+    it and it differs per burst. The posterior also gets 'DM_total' = dm_dedispersion + DM, draw by
+    draw: the dedispersion is a known shift applied to the data and the fit measures what remains,
+    so the spread of DM_total is the spread of the residual DM. Returns the DataTree written.
 
+    path:            output file (netcdf)
+    mcmc:            the finished MCMC object from run.run_fit; samples are taken with
+                     group_by_chain=True, so the leading two axes are (chain, draw)
+    burst:           the ConditionedData the fit used; its event_id and data_path identify the data,
+                     whose contents are hashed, not stored
+    priors:          the priors dict of the fit, as returned by run.set_priors
+    single_pulse_fn: the model closure the fit used; the names of its SED and pulse forms and its
+                     scalar constants are recorded
+    hash_bytes:      hash only the first hash_bytes of the data file (describe_data); None hashes all of it
+    extra_samples:   further posterior arrays to store beside the sampled sites, each already shaped
+                     (n_chains, n_draws, ...) and not sharing a name with a sampled site
     dm_dedispersion: REQUIRED. The DM (pc cm^-3) the data were dedispersed with before this fit,
-                     e.g. from DM_phase. The fitted 'DM' is only the residual on top of it, so it is
-                     recorded as the attribute 'DM_dedispersion', and the posterior gets 'DM_total'
-                     = dm_dedispersion + DM, draw by draw. It is added as an exact number: the
-                     dedispersion is a known shift applied to the data, and the fit measures what
-                     remains, so the spread of DM_total is the spread of the residual DM.
+                     e.g. from DM_phase; the fitted 'DM' is only the residual on top of it. Recorded
+                     as the attribute 'DM_dedispersion'
     dedispersion_ref_freq:
-                     REQUIRED. The frequency (MHz) the dedispersion aligned the channels to (np.inf
-                     for infinite frequency), recorded as 'dedispersion_ref_freq'. The data's time
-                     axis keeps the telescope's clock only at this frequency; every other channel was
-                     shifted by k DM_dedispersion (nu^-2 - nu_dd^-2). The fitted arrival time t at
-                     the model's reference nu_r therefore corresponds to the arrival time
-                     t + k DM_dedispersion (nu_r^-2 - nu_dd^-2) on the telescope's clock, which can
-                     only be recovered with nu_dd.
-    mcmc:           the finished MCMC object; samples are taken with group_by_chain=True, so the
-                     leading two axes are (chain, draw) with no shape guessing
-    burst:           the ConditionedData the fit used
-    priors:          the priors dictionary of the fit, as returned by run.set_priors. For a
-                     marginalized fit this still contains 'A_snr', so the amplitude prior that was
-                     integrated over is recorded too.
-    data_path:       the file that was analyzed; its contents are hashed, not stored
-    single_pulse_fn: the model closure the fit used; only the names of its SED and pulse
-                     functions are recorded
-    extra_samples:   further posterior arrays to store beside the sampled sites, e.g. fluences
-                     drawn after a marginalized fit (run.posthoc_samples returns these). Each must
-                     already be shaped (n_chains, n_draws, ...) to match mcmc's own samples, and
-                     must not share a name with a sampled site
+                     REQUIRED. The frequency (MHz, np.inf for infinite frequency) the dedispersion
+                     aligned the channels to, recorded as 'dedispersion_ref_freq'. The data's time
+                     axis keeps the telescope's clock only at this frequency nu_dd, so the fitted
+                     arrival time t at the model's reference nu_r is t + k DM_dedispersion
+                     (nu_r^-2 - nu_dd^-2) on the telescope's clock
     extra:           any further scalars worth recording (n_pulses, ...), stored as strings
-
-    The reference frequency is recorded because gamma and tau_ref are defined relative to it and
-    it differs per burst; the spectral basis because c1 and c2 are meaningless without it.
     """
     if dm_dedispersion is None:
         raise ValueError("dm_dedispersion must be given: the DM (pc cm^-3) the data were dedispersed "
@@ -134,7 +135,7 @@ def save_run(path, mcmc, burst, priors, data_path, single_pulse_fn=None,
     idata = from_dict({"posterior": samples})
 
     idata.posterior.attrs.update(describe_priors(priors))
-    idata.posterior.attrs.update(describe_data(data_path, event_id, hash_bytes))
+    idata.posterior.attrs.update(describe_data(burst.data_path, burst.event_id or None, hash_bytes))
     idata.posterior.attrs.update({
         "likelihood": mcmc.sampler.model.__name__,
         "seed": str(getattr(mcmc, "seed", "")),       # set by run.run_fit, so the run can be reproduced
@@ -152,20 +153,16 @@ def save_run(path, mcmc, burst, priors, data_path, single_pulse_fn=None,
            if np.ndim(v) == 0},
     })
 
-    P1, P2 = burst.spectral_basis
     freq = np.asarray(burst.freq_channels).reshape(-1)
-    idata["conditioning"] = xr.Dataset(
-        {
-            "P1": ("freq_channel", np.asarray(P1).reshape(-1)),
-            "P2": ("freq_channel", np.asarray(P2).reshape(-1)),
-            "channel_weights": ("freq_channel", np.asarray(burst.channel_weights).reshape(-1)),
-            "channel_width": ("freq_channel", np.asarray(burst.channel_width).reshape(-1)),
-            "sigma_noise_fd": ("freq_channel", np.asarray(burst.sigma_noise_fd).reshape(-1)),
-            "fourier_freqs": ("fourier_freq", np.asarray(burst.fourier_freqs).reshape(-1)),
-            **{f"coeff_{k}": float(v) for k, v in burst.spectral_coeff_map.items()},
-        },
-        coords={"freq_channel": freq},
-    )
+    conditioning = {
+        "channel_weights": ("freq_channel", np.asarray(burst.channel_weights).reshape(-1)),
+        "channel_width": ("freq_channel", np.asarray(burst.channel_width).reshape(-1)),
+        "sigma_noise_fd": ("freq_channel", np.asarray(burst.sigma_noise_fd).reshape(-1)),
+        "fourier_freqs": ("fourier_freq", np.asarray(burst.fourier_freqs).reshape(-1)),
+    }
+    if burst.freq_members is not None:          # raw channels averaged into each block, for the smearing
+        conditioning["freq_members"] = (("freq_channel", "member"), np.asarray(burst.freq_members))
+    idata["conditioning"] = xr.Dataset(conditioning, coords={"freq_channel": freq})
 
     idata.to_netcdf(str(path), engine="h5netcdf")
     return idata
@@ -173,25 +170,37 @@ def save_run(path, mcmc, burst, priors, data_path, single_pulse_fn=None,
 
 def load_run(path):
     """
-    Reads a saved fit back. Returns the DataTree: `["posterior"]` holds the samples and, in its
-    attrs, the priors, likelihood and data reference; `["conditioning"]` holds the spectral basis
-    and per-channel quantities needed to rebuild the model.
+    Reads a saved fit back. Returns the DataTree: ["posterior"] holds the samples and, in its attrs,
+    the priors, likelihood, model constants and data reference; ["conditioning"] holds the
+    per-channel quantities needed to rebuild the model.
+
+    path: the file save_run wrote
     """
     return xr.open_datatree(str(path), engine="h5netcdf")
 
 
 def check_data_unchanged(run, data_path, n_bytes=None):
     """
-    Confirms the file at `data_path` is the one a saved run was fit to, by comparing content
-    hashes. Returns True if they match; raises if the run holds no hash to compare against.
+    Confirms the file at data_path is the one a saved run was fit to, by comparing content hashes.
+    Returns True if they match; raises if the run holds no hash to compare against.
+
+    run:       the DataTree load_run returned
+    data_path: the file to check
+    n_bytes:   hash only its first n_bytes; must match the hash_bytes the run was saved with
     """
     stored = run["posterior"].attrs.get("data.sha256")
     if not stored:
         raise ValueError("this run has no stored data hash to compare against.")
     return stored == describe_data(data_path, n_bytes=n_bytes)["data.sha256"]
 
+
 def to_idata(mcmc, **kwargs):
-    """az.from_numpyro, working around ArviZ's assumption that max_tree_depth is a single number."""
+    """
+    az.from_numpyro, working around ArviZ's assumption that max_tree_depth is a single number.
+
+    mcmc:   the finished MCMC object
+    kwargs: passed to az.from_numpyro
+    """
     depth = mcmc.sampler._max_tree_depth
     if isinstance(depth, tuple):
         mcmc.sampler._max_tree_depth = depth[1]      # the sampling-phase depth, which applied to the draws

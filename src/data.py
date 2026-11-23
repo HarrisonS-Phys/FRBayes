@@ -302,7 +302,7 @@ def prepare_burst(path, event_id=None, n_avg=8, fd_downsample=4, toa=None, exclu
     REMOVED, not zeroed or masked, since which channels remain decides where the block boundaries,
     and so each block's span and smearing, fall.
 
-    path:             .npz holding 'power' (n_chan, n_time), 'freq' (n_chan,) and 'time' (n_time,), already dedispersed; channels in any order
+    path:             .npz holding 'power' (n_chan, n_time), 'freq' (n_chan,) in MHz and 'time' (n_time,) in seconds, already dedispersed; channels in any order. The units matter: the dispersion constant and every prior assume MHz and seconds
     event_id:         identifier of the burst, carried to the saved fit; not used in the conditioning
     n_avg:            raw channels averaged per block
     fd_downsample:    keep the lowest 1 / fd_downsample of the Fourier bins

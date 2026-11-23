@@ -5,7 +5,7 @@ Choose the device first, before anything imports jax (devices.use_device). A fit
 
     priors = set_priors(burst, single_pulse_fn, s_opt=100.0)
     mcmc   = run_fit(burst, single_pulse_fn, priors, n_pulses=n_pulses)
-    idata  = results.save_run(out_path, mcmc, burst, priors, data_path, single_pulse_fn=single_pulse_fn,
+    idata  = results.save_run(out_path, mcmc, burst, priors, single_pulse_fn=single_pulse_fn,
                               dm_dedispersion=..., dedispersion_ref_freq=...)
 
 and maxL_iterative_pulse_fit lets the data decide the number of pulses with maximum-likelihood

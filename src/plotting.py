@@ -112,16 +112,16 @@ def model_from_draw(single_pulse_fn, samples, draw_idx):
 
     single_pulse_fn: the model closure the fit used
     samples:         posterior samples with a flat draw axis, each shaped (n_draws, n_pulses), e.g.
-                     dict(mcmc.get_samples()). Must contain 'A', the fluence: for a marginalized
-                     fit, add the draws from posthoc_samples first, flattened to (n_draws, n_pulses).
+                     dict(mcmc.get_samples()). Must contain 'A', the fluence, which the likelihood
+                     records with either amplitude prior.
     draw_idx:        index of the draw on that axis
 
     Returns (M_FD, M_FD_pulses): the summed model, shape (n_chan, n_fourier), and each pulse
     separately, shape (n_pulses, n_chan, n_fourier).
     """
     if "A" not in samples:
-        raise KeyError("samples has no 'A'. For a marginalized fit, add the fluences drawn by "
-                       "posthoc_samples first, flattened to (n_draws, n_pulses).")
+        raise KeyError("samples has no 'A' (the fluence), which likelihood.FD_gaussianlikelihood records "
+                       "with either amplitude prior.")
     n_pulses = np.shape(samples["mean_arrival_time"])[-1]
     # A parameter stored once per draw rather than per pulse is given to every pulse
     params = {k: jnp.broadcast_to(jnp.asarray(samples[k][draw_idx]).reshape(-1), (n_pulses,))
@@ -146,6 +146,44 @@ def _fluence_spectrum(X_td, dt, n_win):
     return np.nansum(_subtract_baseline(X_td, n_win), axis=-1) * dt
 
 
+def _power_of_ten(values):
+    """
+    Exponent e for drawing `values` as values / 10^e: that of the largest |value| when it is below
+    1e-2 or at least 1e4, where matplotlib would otherwise print a separate "1e-3" that collides
+    with the marginal's label; 0 otherwise.
+
+    values: what the marginal shows
+    """
+    peak = float(np.nanmax(np.abs(values))) if np.size(values) else 0.0
+    if not np.isfinite(peak) or peak == 0.0:
+        return 0
+    e = int(np.floor(np.log10(peak)))
+    return e if (e <= -3 or e >= 4) else 0
+
+
+def _fluence_label(e):
+    """
+    Label of the fluence marginal, with the power of ten its values were divided by.
+
+    e: the exponent from _power_of_ten
+    """
+    return "Fluence" + (rf" [$\times10^{{{e}}}$]" if e else "") + "\n(window mean removed)"
+
+
+def _fourier_axis(burst):
+    """
+    The retained Fourier frequencies in Hz, kHz or MHz, whichever puts the highest of them between
+    1 and 1000, so the tick labels stay short whatever the time resolution; and the axis label.
+
+    burst: the ConditionedData, for its retained Fourier frequencies (Hz)
+    """
+    f = np.asarray(burst.fourier_freqs, dtype=float).reshape(-1)
+    for scale, unit in ((1e6, "MHz"), (1e3, "kHz"), (1.0, "Hz")):
+        if f.max() / scale >= 1.0:
+            break
+    return f / scale, f"Fourier frequency [{unit}]"
+
+
 def _edges_from_centres(centres):
     """Bin edges halfway between neighbouring centres, extended by half a spacing at both ends."""
     c = np.asarray(centres, dtype=float).reshape(-1)
@@ -156,9 +194,20 @@ def _edges_from_centres(centres):
 
 
 def _time_axis(burst):
-    """(centres, edges) of the time samples, which are labeled at their start."""
-    t = np.asarray(burst.times).reshape(-1)
-    return t + 0.5 * burst.dt, np.append(t, t[-1] + burst.dt)
+    """
+    The time samples' centres and edges (samples are labelled at their start) in s, ms or us,
+    whichever puts the segment's length between 1 and 1000, so the tick labels stay short; the
+    seconds per unit, for converting other times in seconds; and the axis label.
+
+    burst: the ConditionedData, for its times and dt (s)
+    """
+    t = np.asarray(burst.times, dtype=float).reshape(-1)
+    duration = burst.n_time * burst.dt
+    for scale, unit in ((1.0, "s"), (1e-3, "ms"), (1e-6, r"$\mu$s")):
+        if duration / scale >= 1.0:
+            break
+    centres, edges = t + 0.5 * burst.dt, np.append(t, t[-1] + burst.dt)
+    return centres / scale, edges / scale, scale, f"Time [{unit}]"
 
 
 def _channel_layout(burst, freq_unit):
@@ -225,6 +274,7 @@ def _draw_waterfall(ax, values, x_edges, ch, vmin, vmax):
     cmap = plt.get_cmap("viridis").copy()
     cmap.set_bad(BAD_COLOUR)
     Z = np.ma.masked_invalid(_on_channels(values, ch))
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=4))       # few enough that the tick labels never touch
     return ax.pcolormesh(x_edges, ch.edges, Z, shading="flat", cmap=cmap, vmin=vmin, vmax=vmax,
                          rasterized=True)
 
@@ -319,8 +369,7 @@ def plot_burst_TD(burst, X_fd=None, title="Data", vlim=None, pct=(1.0, 99.0), re
     burst:      the ConditionedData whose grid is used, e.g. as returned by data.prepare_burst
     X_fd:       what to plot, shape (n_chan, n_fourier): a model, a residual, ... Default
                 burst.data_fd.
-    title:      text at the top; the number of channels, samples and the time resolution are
-                appended, so bursts prepared with different downsampling can be compared
+    title:      text at the top
     vlim:       (low, high) colour limits of the waterfall. Default: the `pct` percentiles of what
                 is plotted. Pass the same vlim to two plots to compare them, e.g. data and model.
     pct:        lower and upper percentiles that set the colour limits when vlim is not given
@@ -341,21 +390,23 @@ def plot_burst_TD(burst, X_fd=None, title="Data", vlim=None, pct=(1.0, 99.0), re
         _announce_rebaseline()
         X_td = _subtract_baseline(X_td, burst.n_noise_bins)
 
-    t_c, t_e = _time_axis(burst)
+    t_c, t_e, t_scale, t_label = _time_axis(burst)
     ch = _channel_layout(burst, freq_unit)
     vmin, vmax = vlim if vlim is not None else np.nanpercentile(X_td, pct)
 
     fig, ax_ts, ax_wf, ax_side = _single_layout()
     _draw_top(ax_ts, np.nansum(X_td, axis=0), t_c, t_e, marginal, color="k", lw=0.8)
+    ax_ts.set_ylabel("Summed intensity")
     ax_ts.set_title(title)
 
     _draw_waterfall(ax_wf, X_td, t_e, ch, vmin, vmax)
-    ax_wf.set_xlabel("Time [s]")
+    ax_wf.set_xlabel(t_label)
     ax_wf.set_ylabel(ch.label)
 
-    _draw_side(ax_side, spectrum, ch, marginal, color="k", lw=0.8)
+    e = _power_of_ten(spectrum)
+    _draw_side(ax_side, spectrum / 10.0 ** e, ch, marginal, color="k", lw=0.8)
     ax_side.axvline(0, color="gray", lw=0.6, ls="--")
-    ax_side.set_xlabel("Fluence\n(window mean removed)")
+    ax_side.set_xlabel(_fluence_label(e))
     plt.show()
     return fig
 
@@ -363,7 +414,7 @@ def plot_burst_TD(burst, X_fd=None, title="Data", vlim=None, pct=(1.0, 99.0), re
 def plot_burst_FD(burst, X_fd=None, title="Data", vlim=None, pct=(1.0, 99.0), freq_unit="MHz",
                   marginal="hist"):
     """
-    The burst in FOURIER space, in units of the noise: the amplitude |X| / sigma_noise_fd of every
+    The burst in FOURIER space, whitened (divided by the noise): the amplitude |X| / sigma_noise_fd of every
     channel and retained Fourier bin, which is what the likelihood weighs. Only the amplitude is
     shown; the phase carries the arrival times. Bad channels are grey (see the module note).
 
@@ -375,9 +426,8 @@ def plot_burst_FD(burst, X_fd=None, title="Data", vlim=None, pct=(1.0, 99.0), fr
                data.prepare_burst
     X_fd:      what to plot, shape (n_chan, n_fourier): a model, a residual, ... Default
                burst.data_fd.
-    title:     text at the top; the number of channels, samples and the time resolution are
-               appended
-    vlim:      (low, high) colour limits of the waterfall, in noise units. Default: the `pct`
+    title:     text at the top
+    vlim:      (low, high) colour limits of the waterfall, whitened. Default: the `pct`
                percentiles of what is plotted. Pass the same vlim to two plots to compare them.
     pct:       lower and upper percentiles that set the colour limits when vlim is not given
     freq_unit: unit of the frequency-channel axis, "MHz" (default), "GHz", "kHz" or "Hz"
@@ -392,23 +442,23 @@ def plot_burst_FD(burst, X_fd=None, title="Data", vlim=None, pct=(1.0, 99.0), fr
     amp = np.abs(X_fd) / sigma
     summed = np.abs(np.nansum(X_fd, axis=0)) / np.sqrt(np.nansum(sigma ** 2, axis=0))
 
-    k_c = np.asarray(burst.fourier_freqs).reshape(-1) / 1e3
+    k_c, k_label = _fourier_axis(burst)
     k_e = _edges_from_centres(k_c)
     ch = _channel_layout(burst, freq_unit)
     vmin, vmax = vlim if vlim is not None else np.nanpercentile(amp, pct)
 
     fig, ax_ts, ax_wf, ax_side = _single_layout()
     _draw_top(ax_ts, summed, k_c, k_e, marginal, color="k", lw=0.8)
-    ax_ts.set_ylabel("|X| / noise")
+    ax_ts.set_ylabel("Whitened Fourier amplitude")
     ax_ts.set_title(title)
 
     # Each Fourier bin is drawn over its own edges, even if the retained bins are uneven
     _draw_waterfall(ax_wf, amp, k_e, ch, vmin, vmax)
-    ax_wf.set_xlabel("Fourier frequency [kHz]")
+    ax_wf.set_xlabel(k_label)
     ax_wf.set_ylabel(ch.label)
 
     _draw_side(ax_side, np.sqrt(np.nanmean(amp ** 2, axis=1)), ch, marginal, color="k", lw=0.8)
-    ax_side.set_xlabel("RMS |X| / noise")
+    ax_side.set_xlabel("Whitened RMS amplitude")
     plt.show()
     return fig
 
@@ -454,7 +504,7 @@ def plot_noise_window(burst, vlim=None, pct=(1.0, 99.0), freq_unit="MHz", margin
     w = np.asarray(burst.channel_weights, dtype=float).reshape(-1)
     profile = np.tensordot(np.sqrt(w / w.sum()), z, axes=(0, 0))          # unit variance for white noise
 
-    t_c, t_e = _time_axis(burst)
+    t_c, t_e, t_scale, t_label = _time_axis(burst)
     ch = _channel_layout(burst, freq_unit)
     win_end = t_e[n_win]
     vmin, vmax = vlim if vlim is not None else np.nanpercentile(X_td, pct)
@@ -464,7 +514,7 @@ def plot_noise_window(burst, vlim=None, pct=(1.0, 99.0), freq_unit="MHz", margin
     n_last = max(n_win // 3, 1)
     last = profile[n_win - n_last:n_win]
     n_tail = max(int(tail_fraction * profile.size), 2)
-    print(f"noise window: first {n_win} of {profile.size} samples (to {win_end * 1e3:.2f} ms)")
+    print(f"noise window: first {n_win} of {profile.size} samples (to {n_win * burst.dt * 1e3:.2f} ms)")
     print(f"  profile mean over the last third of the window, less the window mean: "
           f"{last.mean() / np.sqrt(1.0 / n_last - 1.0 / n_win):+.2f} standard errors "
           f"(emission leaking in shows as clearly positive)")
@@ -475,16 +525,18 @@ def plot_noise_window(burst, vlim=None, pct=(1.0, 99.0), freq_unit="MHz", margin
     _draw_top(ax_ts, np.nansum(X_td, axis=0), t_c, t_e, marginal, color="k", lw=0.8)
     ax_ts.axvspan(t_e[0], win_end, color="tab:orange", alpha=0.2, lw=0, label="noise window")
     ax_ts.legend(loc="upper right", fontsize=7, frameon=False)
+    ax_ts.set_ylabel("Summed intensity")
     ax_ts.set_title("Noise window")
 
     _draw_waterfall(ax_wf, X_td, t_e, ch, vmin, vmax)
     ax_wf.axvline(win_end, color="tab:orange", lw=1.2)
-    ax_wf.set_xlabel("Time [s]")
+    ax_wf.set_xlabel(t_label)
     ax_wf.set_ylabel(ch.label)
 
-    _draw_side(ax_side, spectrum, ch, marginal, color="k", lw=0.8)
+    e = _power_of_ten(spectrum)
+    _draw_side(ax_side, spectrum / 10.0 ** e, ch, marginal, color="k", lw=0.8)
     ax_side.axvline(0, color="gray", lw=0.6, ls="--")
-    ax_side.set_xlabel("Fluence\n(window mean removed)")
+    ax_side.set_xlabel(_fluence_label(e))
     plt.show()
     return fig
 
@@ -538,20 +590,22 @@ def plot_fit_TD(burst, M_FD, M_FD_pulses=None, title_model="Model", vlim=None, p
             pulses_td = _subtract_baseline(pulses_td, burst.n_noise_bins)
     resid_td = data_td - model_td
 
-    t_c, t_e = _time_axis(burst)
+    t_c, t_e, t_scale, t_label = _time_axis(burst)
     ch = _channel_layout(burst, freq_unit)
     vmin, vmax = vlim if vlim is not None else np.nanpercentile(data_td, pct)
 
     fig, panels, legend_cell = _triple_layout()
     titles = ("Data", title_model, "Residual")
+    e = _power_of_ten(spectra[0])                     # one scale for the three marginals, which share an axis
     for (ax_ts, ax_wf, ax_side), X_td, spectrum, name in zip(panels, (data_td, model_td, resid_td), spectra, titles):
         _draw_top(ax_ts, np.nansum(X_td, axis=0), t_c, t_e, marginal, color="k", lw=0.8, label="sum")
         ax_ts.set_title(name)
         _draw_waterfall(ax_wf, X_td, t_e, ch, vmin, vmax)
-        ax_wf.set_xlabel("Time [s]")
-        _draw_side(ax_side, spectrum, ch, marginal, color="k", lw=0.8)
+        ax_wf.set_xlabel(t_label)
+        _draw_side(ax_side, spectrum / 10.0 ** e, ch, marginal, color="k", lw=0.8)
         ax_side.axvline(0, color="gray", lw=0.6, ls="--")
-        ax_side.set_xlabel("Fluence\n(window mean removed)")
+        ax_side.set_xlabel(_fluence_label(e))
+    panels[0][0].set_ylabel("Summed intensity")
     panels[0][1].set_ylabel(ch.label)
     panels[2][0].axhline(0, color="gray", lw=0.6, ls="--")
 
@@ -582,7 +636,7 @@ def plot_fit_FD(burst, M_FD, title_model="Re(Model)", vlim=None, pct=(1.0, 99.0)
     M_FD:        the model on the burst's Fourier grid, shape (n_chan, n_fourier), e.g. from
                  model_from_draw
     title_model: title of the model panel, e.g. f"Re(Model) (draw {draw_idx})"
-    vlim:        (low, high) colour limits of the data and model waterfalls, in noise units.
+    vlim:        (low, high) colour limits of the data and model waterfalls, whitened.
                  Default: the `pct` percentiles of the data. The residual gets its own limits,
                  symmetric about zero, from its 99th percentile of |residual|.
     pct:         lower and upper percentiles that set the data and model colour limits when vlim
@@ -602,7 +656,7 @@ def plot_fit_FD(burst, M_FD, title_model="Re(Model)", vlim=None, pct=(1.0, 99.0)
     resid_w = data_w - model_w
     print(f"whitened residual sd: {float(np.nanstd(resid_w)):.3f}  (expect 1)")
 
-    k_c = np.asarray(burst.fourier_freqs).reshape(-1) / 1e3
+    k_c, k_label = _fourier_axis(burst)
     k_e = _edges_from_centres(k_c)
     ch = _channel_layout(burst, freq_unit)
     vmin, vmax = vlim if vlim is not None else np.nanpercentile(data_w, pct)
@@ -616,9 +670,9 @@ def plot_fit_FD(burst, M_FD, title_model="Re(Model)", vlim=None, pct=(1.0, 99.0)
         ax_ts.set_title(name)
         # Each Fourier bin is drawn over its own edges, even if the retained bins are uneven
         _draw_waterfall(ax_wf, X, k_e, ch, lo, hi)
-        ax_wf.set_xlabel("Fourier frequency [kHz]")
+        ax_wf.set_xlabel(k_label)
         _draw_side(ax_side, np.sqrt(np.nanmean(X ** 2, axis=1)), ch, marginal, color="k", lw=0.8)
-        ax_side.set_xlabel("RMS / noise")
+        ax_side.set_xlabel("Whitened RMS")
     panels[0][1].set_ylabel(ch.label)
     panels[2][0].axhline(0, color="gray", lw=0.6, ls="--")
     panels[2][2].axvline(1.0, color="gray", lw=0.6, ls="--")
@@ -628,15 +682,25 @@ def plot_fit_FD(burst, M_FD, title_model="Re(Model)", vlim=None, pct=(1.0, 99.0)
     return fig
 
 
-def _draw_box(ax, ch, box, label, colour, linestyle="-", linewidth=1.5):
-    """Outlines a box of postprocess.excess_power_search on a time waterfall: whole channels, from
-    the lower edge of its first to the upper edge of its last, over its time extent."""
+def _draw_box(ax, ch, box, label, colour, t_scale, linestyle="-", linewidth=1.5):
+    """
+    Outlines a box of postprocess.excess_power_search on a time waterfall: whole channels, from
+    the lower edge of its first to the upper edge of its last, over its time extent.
+
+    ax:        the waterfall's axes
+    ch:        the channel layout (_channel_layout)
+    box:       the box dict, with 'channel_index' and 't_range' (s)
+    label:     text drawn at the box's top-left corner
+    colour:    of the outline and label
+    t_scale:   seconds per unit of the time axis (_time_axis)
+    linestyle, linewidth: of the outline
+    """
     from matplotlib.patches import Rectangle
 
     c0, c1 = box["channel_index"]
     seg = np.flatnonzero((ch.block >= c0) & (ch.block < c1))
     lo, hi = ch.edges[seg.min()], ch.edges[seg.max() + 1]
-    t0, t1 = box["t_range"]
+    t0, t1 = np.asarray(box["t_range"], dtype=float) / t_scale
     ax.add_patch(Rectangle((t0, lo), t1 - t0, hi - lo, fill=False, edgecolor=colour,
                            linewidth=linewidth, linestyle=linestyle))
     ax.text(t0, hi, label, color=colour, fontsize=9, fontweight="bold", va="bottom", ha="left",
@@ -676,7 +740,7 @@ def plot_residual_tiles(burst, M_FD, result, n_show=None, vlim=None, pct=(1.0, 9
         _announce_rebaseline()
         panels = [(name, _subtract_baseline(X, burst.n_noise_bins)) for name, X in panels]
 
-    t_c, t_e = _time_axis(burst)
+    t_c, t_e, t_scale, t_label = _time_axis(burst)
     ch = _channel_layout(burst, freq_unit)
     vmin, vmax = vlim if vlim is not None else np.nanpercentile(panels[0][1], pct)
 
@@ -685,10 +749,10 @@ def plot_residual_tiles(burst, M_FD, result, n_show=None, vlim=None, pct=(1.0, 9
         _draw_waterfall(ax, X, t_e, ch, vmin, vmax)
         for rank, t in reversed(list(enumerate(tiles, start=1))):
             significant = t["log10_p_single"] < log10_limit
-            _draw_box(ax, ch, t, f"{rank}", colour, linestyle="-" if significant else "--",
+            _draw_box(ax, ch, t, f"{rank}", colour, t_scale, linestyle="-" if significant else "--",
                       linewidth=2.0 if rank == 1 else 1.2)
         ax.set_title(name)
-        ax.set_xlabel("Time [s]")
+        ax.set_xlabel(t_label)
     axes[0][0].set_ylabel(ch.label)
     fig.suptitle("Residual boxes (dashed: not significant)", fontsize=10)
     fig.tight_layout()
@@ -725,7 +789,7 @@ def plot_boxes_explained(burst, M_FD_old, M_FD_new, check, vlim=None, pct=(1.0, 
         _announce_rebaseline()
         panels = [(name, _subtract_baseline(X, burst.n_noise_bins)) for name, X in panels]
 
-    t_c, t_e = _time_axis(burst)
+    t_c, t_e, t_scale, t_label = _time_axis(burst)
     ch = _channel_layout(burst, freq_unit)
     vmin, vmax = vlim if vlim is not None else np.nanpercentile(panels[0][1], pct)
 
@@ -741,9 +805,9 @@ def plot_boxes_explained(burst, M_FD_old, M_FD_new, check, vlim=None, pct=(1.0, 
         _draw_waterfall(ax, X, t_e, ch, vmin, vmax)
         for rank, b in reversed(list(enumerate(check["boxes"], start=1))):
             c, ls = style(b)
-            _draw_box(ax, ch, b, f"{rank}", c, linestyle=ls, linewidth=2.5)
+            _draw_box(ax, ch, b, f"{rank}", c, t_scale, linestyle=ls, linewidth=2.5)
         ax.set_title(name)
-        ax.set_xlabel("Time [s]")
+        ax.set_xlabel(t_label)
     axes[0][0].set_ylabel(ch.label)
     fig.suptitle("Boxes explained by the new fit (white: explained, red: not explained, "
                  "dashed grey: model unchanged)", fontsize=10)
