@@ -37,8 +37,9 @@ class ModelConstants:
     delta: int | float = -4  # scattering index, tau proportional to nu^delta; a Python int so nu^delta lowers to an integer power (a sampled 'delta' overrides it)
     k_DM: float = (2.41 * 1e-4) ** (-1)  # dispersion constant (pc^-1 cm^3 MHz^2 s)
     epsilon: int | float = -2  # dispersion index, delay proportional to nu^epsilon; the pulse model requires -2
-    DM_incoherent: float = 0.0  # DM removed only by incoherent dedispersion (pc cm^-3), which smears each channel; 0 for coherent dedispersion
-    channel_width: float | jnp.ndarray = 0.0  # channel width (MHz), a scalar or (n_chan, 1) per block; 0 leaves out intra-channel smearing
+    DM_incoherent: float = 0.0  # DM removed only by incoherent dedispersion (pc cm^-3), which smears each raw channel; 0 for coherent dedispersion
+    freq_members: jnp.ndarray = None  # (n_chan, n_mem) centres (MHz) of the raw channels averaged into each channel, from data.prepare_burst; None leaves out intra-channel smearing
+    raw_channel_width: float = 0.0  # width of one raw channel (MHz), burst.raw_dnu
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,50 @@ class FDGrid:
     freqs_channels_disp: jnp.ndarray = None  # nu_a^epsilon, for the dispersion delay
     freq_ref_disp: jnp.ndarray = None  # nu_r^epsilon, the reference frequency's dispersion delay
     bin_transfer: jnp.ndarray = None  # sinc(f_c dt) exp(i pi f_c dt), the effect of averaging over a time bin
+    smear_runs: dict = None  # constants of intra-channel smearing, from _smearing_runs; None without it
+
+
+def _smearing_runs(freqs_channels, constants):
+    """
+    The constants of intra-channel dispersion smearing. Each channel's members (the raw channels
+    averaged into it, constants.freq_members) are split into runs of adjacent raw channels, a new
+    run starting wherever bad channels leave a gap. For a run with outer edges nu_lo and nu_hi
+    (members' extremes +- half a raw channel width) and channel centre nu_a, all in MHz:
+    'weight', its share of the channel's members; 'width', nu_lo^-2 - nu_hi^-2, the spread of its
+    delays per unit k_DM DM; 'offset', 1 / (nu_lo nu_hi) - nu_a^-2, its mean delay (the average of
+    nu^-2 over the run) less that at the channel centre; and, for incoherent dedispersion, which
+    aligns raw channels at their own centres nu_m, the same two quantities for one raw channel
+    at the run's centre, 'raw_width' and 'raw_offset'. Runs are padded with zero weight to the
+    most any channel has. Computed in float64 and returned as (n_chan, n_runs, 1) float32 arrays,
+    with 'multi', the indices of the channels with more than one run (those straddling bad
+    channels); None without freq_members.
+
+    freqs_channels: channel centres nu_a (MHz), shape (n_chan,) or (n_chan, 1)
+    constants:      the ModelConstants, for freq_members and raw_channel_width
+    """
+    if constants.freq_members is None:
+        return None
+    members = np.sort(np.asarray(constants.freq_members, dtype=np.float64), axis=1)
+    nu_a = np.asarray(freqs_channels, dtype=np.float64).reshape(-1)
+    dnu = float(constants.raw_channel_width)
+    if members.shape[0] != nu_a.size:
+        raise ValueError(f"freq_members has {members.shape[0]} rows but there are {nu_a.size} channels.")
+    runs = [np.split(m, np.where(np.diff(m) > 1.5 * dnu)[0] + 1) for m in members]   # split at gaps
+    n_runs = max(len(r) for r in runs)
+    names = ("weight", "width", "offset", "raw_width", "raw_offset")
+    out = {name: np.zeros((nu_a.size, n_runs)) for name in names}
+    for c, channel_runs in enumerate(runs):
+        for r, run in enumerate(channel_runs):
+            lo, hi = run.min() - 0.5 * dnu, run.max() + 0.5 * dnu
+            mid = 0.5 * (run.min() + run.max())
+            out["weight"][c, r] = run.size / members.shape[1]
+            out["width"][c, r] = lo ** -2 - hi ** -2
+            out["offset"][c, r] = 1.0 / (lo * hi) - nu_a[c] ** -2
+            out["raw_width"][c, r] = (mid - 0.5 * dnu) ** -2 - (mid + 0.5 * dnu) ** -2
+            out["raw_offset"][c, r] = 1.0 / ((mid - 0.5 * dnu) * (mid + 0.5 * dnu)) - mid ** -2
+    result = {name: jnp.asarray(v[..., None], dtype=jnp.float32) for name, v in out.items()}
+    result["multi"] = np.array([c for c, channel_runs in enumerate(runs) if len(channel_runs) > 1], dtype=int)
+    return result
 
 
 def build_fd_grid(freqs_channels: jnp.ndarray, times: jnp.ndarray, constants: ModelConstants, fourier_freqs=None) -> FDGrid:
@@ -64,7 +109,7 @@ def build_fd_grid(freqs_channels: jnp.ndarray, times: jnp.ndarray, constants: Mo
 
     freqs_channels: channel centres (MHz), shape (n_chan,) or (n_chan, 1)
     times:          sample times relative to the segment start (s); the first, the spacing and the count are used
-    constants:      the ModelConstants, for nu_r and epsilon
+    constants:      the ModelConstants, for nu_r, epsilon and the intra-channel smearing (_smearing_runs)
     fourier_freqs:  the Fourier bins to evaluate on (Hz), from data.prepare_burst; None uses every rfft bin of `times`
     """
     freqs_channels = jnp.asarray(freqs_channels, dtype=jnp.float32)
@@ -106,6 +151,7 @@ def build_fd_grid(freqs_channels: jnp.ndarray, times: jnp.ndarray, constants: Mo
         # Samples are labelled at the start of their bin, so each averages over [t_b, t_b + dt]: a
         # boxcar whose transform is sinc(f dt) with a half-bin phase shift
         bin_transfer=jnp.sinc(fourier_freqs * dt) * jnp.exp(1j * jnp.pi * fourier_freqs * dt),
+        smear_runs=_smearing_runs(freqs_channels, constants),
     )
 
 
@@ -134,21 +180,31 @@ def running_power_law_log_sed(params_dict: dict, grid: FDGrid, constants: ModelC
 # 3. Pulse shape in the Fourier domain
 # -------------------------------------------------------------------
 
-def scattered_gaussian_fd_pulse(params_dict: dict, grid: FDGrid, constants: ModelConstants) -> jnp.ndarray:
+def gaussian_arrival_fd(params_dict: dict, grid: FDGrid) -> jnp.ndarray:
     """
-    The Fourier transform of one pulse's shape in every channel, before its SED, shape
-    (n_chan, n_fourier): a Gaussian of width sigma centred at the dispersed arrival time mu_a,
-    convolved with a one-sided exponential of time constant tau_a = tau_ref (nu_a / nu_r)^delta, then
-    with the boxcars of intra-channel dispersion smearing and of the time bin,
+    The Gaussian envelope and the arrival time at nu_r of one pulse in the Fourier domain,
+    exp(-2 pi^2 sigma^2 f_c^2 - 2 pi i f_c t), shape (1, n_fourier): the part of
+    scattered_gaussian_fd_pulse that differs between pulses whose DM and scattering are shared. It
+    depends on the Fourier frequency alone, not on the channel.
 
-        T_ac = exp(-2 pi^2 sigma^2 f_c^2 - 2 pi i f_c mu_a) / (1 + 2 pi i f_c tau_a)
-               x sinc(f_c dt_smear,a) x sinc(f_c dt) exp(i pi f_c dt),
-
-    with sinc(x) = sin(pi x) / (pi x) and mu_a = t + k_DM DM (nu_a^-2 - nu_r^-2) - t_start.
-
-    params_dict: one pulse's parameters; reads 'mean_arrival_time' (s, at nu_r), 'sigma' (s), 'DM' (residual, pc cm^-3), 'tau_ref' (s), and 'delta' if sampled
+    params_dict: one pulse's parameters; reads 'mean_arrival_time' (s, at nu_r) and 'sigma' (s)
     grid:        the FDGrid the template is evaluated on
-    constants:   the ModelConstants, for k_DM, epsilon, delta, DM_incoherent and channel_width
+    """
+    t = jnp.float32(params_dict["mean_arrival_time"])                   # centre of the Gaussian at nu_r
+    sigma = jnp.float32(params_dict["sigma"])                           # intrinsic width
+    return jnp.exp(-2 * (jnp.pi ** 2) * (sigma ** 2) * grid.fourier_freqs_sq - 2j * jnp.pi * grid.fourier_freqs * t)
+
+
+def shared_transfer_fd(params_dict: dict, grid: FDGrid, constants: ModelConstants) -> jnp.ndarray:
+    """
+    The rest of scattered_gaussian_fd_pulse, shape (n_chan, n_fourier): the dispersion delay of each
+    channel relative to nu_r (less the first sample's time), the scattering tail, the intra-channel
+    smearing and the time bin. It depends only on DM, tau_ref and delta, so pulses that share them
+    share it.
+
+    params_dict: one pulse's parameters; reads 'DM' (residual, pc cm^-3), 'tau_ref' (s), and 'delta' if sampled
+    grid:        the FDGrid the template is evaluated on
+    constants:   the ModelConstants, for k_DM, epsilon, delta and DM_incoherent
     """
     if constants.epsilon != -2:
         raise ValueError("Pulse model valid only for epsilon = -2.")
@@ -156,34 +212,77 @@ def scattered_gaussian_fd_pulse(params_dict: dict, grid: FDGrid, constants: Mode
     # A sampled delta is a float32 tracer; the fixed one is a Python int, so the power below is an integer power
     delta = params_dict.get("delta", constants.delta)
 
-    mean_arrival_time = jnp.float32(params_dict["mean_arrival_time"])   # centre of the Gaussian at nu_r
-    sigma = jnp.float32(params_dict["sigma"])                           # intrinsic width
     DM = jnp.float32(params_dict["DM"])                                 # residual dispersion measure
     tau_ref = jnp.float32(params_dict["tau_ref"])                       # scattering time at nu_r; 0 for no scattering
     k_DM = jnp.float32(constants.k_DM)
 
-    # Centre of the Gaussian in each channel, relative to the first sample
-    mu_a = mean_arrival_time + k_DM * DM * (grid.freqs_channels_disp - grid.freq_ref_disp) - grid.t_start
+    # Each channel's delay relative to nu_r, measured from the first sample
+    delay_a = k_DM * DM * (grid.freqs_channels_disp - grid.freq_ref_disp) - grid.t_start
     tau_a = tau_ref * (grid.normalized_freqs_channels ** delta)          # scattering time in each channel
 
-    T = jnp.exp(
-        -2 * ((jnp.pi ** 2) * (sigma ** 2) * grid.fourier_freqs_sq)
-        - 2j * (jnp.pi * grid.fourier_freqs * mu_a)
-    ) / (1 + 2j * jnp.pi * grid.fourier_freqs * tau_a)
+    # Intra-channel dispersion smearing S_ac (see scattered_gaussian_fd_pulse): it depends on the
+    # sampled DM, so it is computed here, from the run constants _smearing_runs precomputed in build_fd_grid
+    runs, smear = grid.smear_runs, 1.0
+    if runs is not None:
+        DM_inc = jnp.float32(constants.DM_incoherent)
+        shift = k_DM * (DM * runs["offset"] + DM_inc * runs["raw_offset"])   # each run's mean delay, (n_chan, n_runs, 1)
 
-    # Intra-channel dispersion smearing: the delay difference across each channel (epsilon = -2), a
-    # boxcar centred on the channel's own delay. It depends on the sampled DM, so it is computed here.
-    # TO-DO: check this convention -> channels are labelled at their centres, so the smearing boxcar is centred on the channel-centre delay (no phase).
-    DM_inc = jnp.float32(constants.DM_incoherent)
-    channel_width = jnp.float32(constants.channel_width)
-    dt_smear = k_DM * (DM_inc + DM) * (
-        (2.0 * grid.freqs_channels * channel_width) / ((grid.freqs_channels ** 2 - (channel_width ** 2 / 4.0)) ** 2)
-    )
-    instrmnt_smear_transfer = jnp.sinc(grid.fourier_freqs * dt_smear)
+        def spread(width, raw_width, f):
+            """The run's boxcars in the Fourier domain: residual DM across it, DM_inc across a raw channel."""
+            out = jnp.sinc(f * k_DM * DM * width)
+            if constants.DM_incoherent > 0:
+                out = out * jnp.sinc(f * k_DM * DM_inc * raw_width)
+            return out
 
-    # Time binning, precomputed in build_fd_grid.
-    # TO-DO: check this convention -> bins are labelled at their start, so each sample averages over [t_b, t_b + dt_bin].
-    return T * instrmnt_smear_transfer * grid.bin_transfer
+        # Every channel's first run: its mean-delay shift moves the whole template, so it joins the
+        # channel's delay in the phase computed below instead of needing a phase of its own
+        delay_a = delay_a + shift[:, 0, :]
+        smear = runs["weight"][:, 0, :] * spread(runs["width"][:, 0, :], runs["raw_width"][:, 0, :],
+                                                 grid.fourier_freqs)
+        # The other runs exist only in the few channels straddling bad channels, so they are
+        # computed for those alone, each with its delay relative to the first run
+        multi = runs["multi"]
+        if multi.size:
+            f = grid.fourier_freqs[None]                                 # (1, 1, n_fourier)
+            extra = jnp.sum(runs["weight"][multi, 1:]
+                            * spread(runs["width"][multi, 1:], runs["raw_width"][multi, 1:], f)
+                            * jnp.exp(-2j * jnp.pi * f * (shift[multi, 1:] - shift[multi, :1])), axis=1)
+            smear = smear.astype(jnp.complex64).at[multi].add(extra)
+
+    # Time binning, precomputed in build_fd_grid: samples are labelled at the start of their bin, so
+    # each averages over [t_b, t_b + dt]
+    return (jnp.exp(-2j * jnp.pi * grid.fourier_freqs * delay_a) / (1 + 2j * jnp.pi * grid.fourier_freqs * tau_a)
+            * smear * grid.bin_transfer)
+
+
+def scattered_gaussian_fd_pulse(params_dict: dict, grid: FDGrid, constants: ModelConstants) -> jnp.ndarray:
+    """
+    The Fourier transform of one pulse's shape in every channel, before its SED, shape
+    (n_chan, n_fourier): a Gaussian of width sigma centred at the dispersed arrival time mu_a,
+    convolved with a one-sided exponential of time constant tau_a = tau_ref (nu_a / nu_r)^delta, then
+    with the intra-channel dispersion smearing S_ac and the boxcar of the time bin,
+
+        T_ac = exp(-2 pi^2 sigma^2 f_c^2 - 2 pi i f_c mu_a) / (1 + 2 pi i f_c tau_a)
+               x S_ac x sinc(f_c dt) exp(i pi f_c dt),
+
+    with sinc(x) = sin(pi x) / (pi x) and mu_a = t + k_DM DM (nu_a^-2 - nu_r^-2) - t_start. Each run r
+    of adjacent raw channels in channel a (_smearing_runs) spreads the residual DM's delays over a
+    boxcar centred on the run's mean delay, and with incoherent dedispersion each raw channel is
+    further spread by DM_inc over its own width:
+
+        S_ac = sum_r w_ar sinc(f_c k_DM DM W_ar) sinc(f_c k_DM DM_inc V_ar)
+               x exp(-2 pi i f_c k_DM (DM O_ar + DM_inc P_ar)),
+
+    with w, W, O, V and P the run's 'weight', 'width', 'offset', 'raw_width' and 'raw_offset'. It is
+    computed as gaussian_arrival_fd x shared_transfer_fd: the first holds everything that differs
+    between pulses whose DM and scattering are shared, the second everything that does not, so a
+    burst of such pulses can build the second once (likelihood.FD_gaussianlikelihood).
+
+    params_dict: one pulse's parameters; reads 'mean_arrival_time' (s, at nu_r), 'sigma' (s), 'DM' (residual, pc cm^-3), 'tau_ref' (s), and 'delta' if sampled
+    grid:        the FDGrid the template is evaluated on
+    constants:   the ModelConstants, for k_DM, epsilon, delta and DM_incoherent
+    """
+    return gaussian_arrival_fd(params_dict, grid) * shared_transfer_fd(params_dict, grid, constants)
 
 
 # -------------------------------------------------------------------
@@ -226,7 +325,9 @@ def setup_model(
     channels, exp(ln F - max ln F) T, which cannot overflow, and likelihood.FD_gaussianlikelihood
     sets the amplitude. The closure also carries .constants, .grid (the data's FDGrid),
     .log_sed_peak, .sed_fn and .pulse_fn (the forms' names, recorded by results.save_run),
-    .segment_duration, .model_duration_pad, .n_long and .extend_model_duration.
+    .segment_duration, .model_duration_pad, .n_long, .extend_model_duration, .pulse_factors and
+    .shared_factor (the factored form of the default pulse, else None) and .cut (the cut of a padded
+    template to the data window, None without padding).
 
     constants_dict:     keyword arguments of ModelConstants
     freqs_channels:     channel centres (MHz), shape (n_chan,) or (n_chan, 1)
@@ -237,9 +338,9 @@ def setup_model(
     model_duration_pad: padding against wraparound (s), rounded up to an FFT-friendly window; 0 (default) for none; usually set with .extend_model_duration
     """
     constants = ModelConstants(**constants_dict)
-    # channel_width may be a scalar or a per-channel array, so reduce the comparison before testing it
-    if constants.DM_incoherent > 0 and bool(jnp.all(jnp.asarray(constants.channel_width) == 0)):
-        raise ValueError("DM_incoherent > 0 but channel_width = 0: intra-channel smearing would be silently omitted.")
+    if constants.DM_incoherent > 0 and (constants.freq_members is None or constants.raw_channel_width <= 0):
+        raise ValueError("DM_incoherent > 0 needs freq_members and raw_channel_width: intra-channel smearing "
+                         "would be silently omitted.")
     grid = build_fd_grid(freqs_channels, times, constants, fourier_freqs)
 
     # ---- Padding: the longer window the template is evaluated on, and the cut back to the data ----
@@ -308,6 +409,19 @@ def setup_model(
     single_pulse_model.sed_fn = sed_fn.__name__                            # names of the forms, recorded by results.save_run
     single_pulse_model.pulse_fn = pulse_fn.__name__
     single_pulse_model.log_sed_peak = log_sed_peak
+
+    # The factored form of the default pulse, for bursts whose pulses share DM and scattering: each
+    # pulse's ln F (n_chan, 1) and Gaussian-and-arrival factor (1, n_eval), and the factor they all
+    # share (n_chan, n_eval), on the grid templates are evaluated on (the padded window's, with
+    # padding); .cut takes a padded template to the data's window and retained bins (None without
+    # padding)
+    factored = pulse_fn is scattered_gaussian_fd_pulse
+    single_pulse_model.pulse_factors = (
+        (lambda params_dict: (sed_fn(params_dict, eval_grid, constants), gaussian_arrival_fd(params_dict, eval_grid)))
+        if factored else None)
+    single_pulse_model.shared_factor = (
+        (lambda params_dict: shared_transfer_fd(params_dict, eval_grid, constants)) if factored else None)
+    single_pulse_model.cut = truncate
 
     def extend_model_duration(burst=None, priors=None, wrapped_snr=1.0, n_tau=3.0, n_sigma=3.0,
                               time_param="mean_arrival_time", factor=None):

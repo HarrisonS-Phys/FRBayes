@@ -101,6 +101,66 @@ def pulse_templates(
     return jax.vmap(single_pulse_fn)(params_stacked)
 
 
+def _can_factor(single_pulse_fn, shared_params, priors) -> bool:
+    """
+    Whether the burst's model can be built in factored form (_factored_terms): the model offers it
+    (single_pulse_fn.shared_factor) and everything that factor depends on is shared between the
+    pulses: DM, tau_ref, and delta if it is sampled.
+
+    single_pulse_fn: the model closure from model.setup_model
+    shared_params:   names of the parameters sampled once for the whole burst
+    priors:          the priors of the fit, to tell whether delta is sampled
+    """
+    shared = set(shared_params)
+    return (getattr(single_pulse_fn, "shared_factor", None) is not None
+            and {"DM", "tau_ref"} <= shared and ("delta" not in priors or "delta" in shared))
+
+
+def _factored_terms(params_stacked, single_pulse_fn, inv_noise_var, amplitude_in_snr):
+    """
+    The pulses' template powers per channel and their sum, built in factored form. Each template is
+    T_jac = F_ja g_jc C_ac: F the pulse's SED (peak-scaled to 1, or times its fluence A), g its
+    Gaussian and arrival time (one value per Fourier bin), and C the factor every pulse shares
+    (model.shared_transfer_fd). So C is built once, the power per channel is
+    F_ja^2 sum_c |g_jc|^2 |C_ac|^2 / sigma_ac^2, and the model sum_j amp_j T_j is C times the matrix
+    product of (amp_j F_ja) with g_jc: the same numbers as summing the full templates, with
+    per-pulse work on n_chan + n_fourier values instead of n_chan x n_fourier. Matrix products use
+    full float32 precision (some GPUs would otherwise round their inputs). With padding the
+    templates are built on the padded window the same way, but each must then be cut to the data
+    window on its own (single_pulse_fn.cut, a pair of FFTs), since the cut mixes Fourier bins and
+    the per-pulse powers need each pulse cut; only the evaluation of the factors is saved. Returns
+    (power_chan (n_pulses, n_chan), combine(amp) -> model (n_chan, n_fourier)).
+
+    params_stacked:   parameter arrays of shape (n_pulses,), from sample_pulse_parameters
+    single_pulse_fn:  the model closure, with .pulse_factors and .shared_factor
+    inv_noise_var:    1 / sigma^2 on every bin, (n_chan, n_fourier)
+    amplitude_in_snr: True for A_snr fits (SED peak scaled to 1), False for fluence fits ('A')
+    """
+    hi = jax.lax.Precision.HIGHEST
+    lnF, g = jax.vmap(single_pulse_fn.pulse_factors)(params_stacked)
+    lnF, g = lnF[..., 0], g[:, 0, :]                                     # (n_pulses, n_chan), (n_pulses, n_fourier)
+    C = single_pulse_fn.shared_factor({name: v[0] for name, v in params_stacked.items()})   # shared: every pulse's value is the same
+    if amplitude_in_snr:
+        F = jnp.exp(lnF - jnp.max(lnF, axis=1, keepdims=True))         # SED peak scaled to 1, as model.py does
+    else:
+        # A F = sign(A) exp(ln|A| + ln F), in log space as model.py does
+        A = jnp.asarray(params_stacked["A"], dtype=jnp.float32)
+        F = jnp.sign(A)[:, None] * jnp.exp(jnp.log(jnp.abs(A))[:, None] + lnF)
+    cut = getattr(single_pulse_fn, "cut", None)
+    if cut is not None:
+        # Padded: each pulse's template on the long window, a product of its factors, cut to the data window
+        templates = jax.vmap(lambda F_j, g_j: cut(F_j[:, None] * g_j[None, :] * C))(F.astype(g.dtype), g)
+        power_chan = jnp.sum(jnp.abs(templates) ** 2 * inv_noise_var[None], axis=-1)
+        return power_chan, lambda amp: jnp.sum(amp[:, None, None] * templates, axis=0)
+
+    power_chan = F ** 2 * jnp.matmul(jnp.abs(g) ** 2, (jnp.abs(C) ** 2 * inv_noise_var).T, precision=hi)
+
+    def combine(amp):
+        weights = (amp[:, None] * F).T.astype(g.dtype)                  # (n_chan, n_pulses)
+        return C * jnp.matmul(weights, g, precision=hi)
+    return power_chan, combine
+
+
 def log_sed_peaks(params_stacked, single_pulse_fn) -> jnp.ndarray:
     """
     ln max_a F_a, the log of each pulse's SED at its brightest channel, shape (n_pulses,). Without
@@ -206,7 +266,10 @@ def FD_gaussianlikelihood(
     by A_snr / snr_opt and records the fluence as the deterministic site 'A' (with 'snr_opt' and
     'log_sed_peak'). An amplitude in SNR units makes its prior scale with each template's
     detectability, so the prior does not favour narrow, easily detected templates, and one prior
-    suits every burst.
+    suits every burst. When the pulses share DM and tau_ref (and delta, if sampled) and the model
+    offers its factored form (single_pulse_fn.shared_factor, the default pulse), the factor they
+    share is built once and, without padding, the pulses are combined by a matrix product, which
+    gives the same model at a fraction of the cost (_factored_terms).
 
     data_fd:         complex data on the retained Fourier bins, shape (n_chan, n_fourier), from data.prepare_burst
     sigma_noise_fd:  noise std of the real/imaginary part of each bin, shape (n_chan, 1) or (n_chan, n_fourier)
@@ -224,26 +287,34 @@ def FD_gaussianlikelihood(
     _validate_fourier_inputs(data_fd, sigma_noise_fd)
 
     params_stacked = sample_pulse_parameters(n_pulses, shared_params, priors, time_param)
-    templates = pulse_templates(params_stacked, single_pulse_fn)        # (n_pulses, n_chan, n_fourier)
 
     # 1 / sigma^2 on every bin, whether the noise was given per channel or per bin
     inv_noise_var = 1.0 / jnp.broadcast_to(jnp.asarray(sigma_noise_fd, dtype=jnp.float32), data_fd.shape) ** 2
 
+    # power_chan: each pulse's template power per channel, sum_c |T_jac|^2 / sigma^2, shape
+    # (n_pulses, n_chan); combine(amp): the model sum_j amp_j T_j. Without 'A' the templates have
+    # their SED peak scaled to 1 (model.py), with it they carry their fluence.
+    if _can_factor(single_pulse_fn, shared_params, priors):
+        power_chan, combine = _factored_terms(params_stacked, single_pulse_fn, inv_noise_var, amplitude_in_snr)
+    else:
+        templates = pulse_templates(params_stacked, single_pulse_fn)    # (n_pulses, n_chan, n_fourier)
+        power_chan = jnp.sum(jnp.abs(templates) ** 2 * inv_noise_var[None], axis=-1)
+        combine = lambda amp: jnp.sum(amp[:, None, None] * templates, axis=0)
+
     if amplitude_in_snr:
-        # Without 'A', model.py returns each template with its SED peak scaled to 1; its noise-weighted
-        # norm is then the SNR per unit amplitude
-        snr_opt = jnp.sqrt(jnp.maximum(jnp.sum(jnp.abs(templates) ** 2 * inv_noise_var[None], axis=(1, 2)), _EPS))
+        # The noise-weighted norm of a peak-normalized template is the SNR per unit amplitude
+        snr_opt = jnp.sqrt(jnp.maximum(jnp.sum(power_chan, axis=1), _EPS))
         numpyro.deterministic("snr_opt", snr_opt)
 
         A_peak_channel = params_stacked["A_snr"] / snr_opt                 # amplitude on the peak-normalized template
-        model_fd = jnp.sum(A_peak_channel[:, None, None] * templates, axis=0)
+        model_fd = combine(A_peak_channel)
         log_peak = numpyro.deterministic("log_sed_peak", log_sed_peaks(params_stacked, single_pulse_fn))
         numpyro.deterministic("A", fluence_for_normalized_log_sed_models(A_peak_channel, log_peak))
         pulse_snr = params_stacked["A_snr"]                                 # each pulse's SNR, for the repulsion
     else:
-        # With 'A', model.py has already multiplied each template by its fluence
-        model_fd = jnp.sum(templates, axis=0)
-        pulse_snr = jnp.sqrt(jnp.sum(jnp.abs(templates) ** 2 * inv_noise_var[None], axis=(1, 2)))
+        # With 'A', the templates already carry their fluence
+        model_fd = combine(jnp.ones(n_pulses, dtype=jnp.float32))
+        pulse_snr = jnp.sqrt(jnp.sum(power_chan, axis=1))
 
     # Repulsion between active pulses; see repulsive_toa_prior
     if repulsion is not None and n_pulses > 1:
@@ -251,7 +322,6 @@ def FD_gaussianlikelihood(
         tau_factor = None
         if rep.pop("band_tau", True):
             # Each pulse's SNR^2 share per channel, and its mean scattering factor (nu / nu_ref)^delta there
-            power_chan = jnp.sum(jnp.abs(templates) ** 2 * inv_noise_var[None], axis=-1)       # (n_pulses, n_chan)
             w_chan = power_chan / jnp.sum(power_chan, axis=-1, keepdims=True)
             nu_over_ref = jnp.asarray(single_pulse_fn.grid.normalized_freqs_channels).reshape(-1)
             # the sampled scattering index if there is one, else the model's fixed value

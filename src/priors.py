@@ -114,6 +114,26 @@ def dispersion_prior_bounds(burst, single_pulse_fn):
             "DM_max": D_max}
 
 
+def spectral_index_bound(burst, beta_min):
+    """
+    Bound of the symmetric spectral index prior, gamma ~ Uniform(-gamma_max, gamma_max). The running
+    power law ln F = gamma x + beta x^2, x = ln(nu / nu_ref), is a Gaussian in x for beta < 0, peaking
+    at x_p = gamma / (2 |beta|); gamma_max = 2 |beta_min| max(|x_bot|, |x_top|) is the gamma the
+    narrowest allowed spectrum (beta = beta_min) needs to peak at the band edge farther from nu_ref,
+    so every allowed width can peak anywhere in the band, wherever nu_ref sits.
+
+    burst:    the ConditionedData, for the band edges (lowest and highest channel) and nu_ref
+    beta_min: lower bound of the beta prior, which must be negative
+    """
+    if not beta_min < 0:
+        raise ValueError(f"the gamma bound from the band needs beta's lower bound to be negative; got {beta_min}. "
+                         f"Pass gamma_range instead.")
+    nu = np.asarray(burst.freq_channels, dtype=float).reshape(-1)
+    nu_ref = float(burst.freq_channels_ref)
+    x_far = max(abs(np.log(nu.min() / nu_ref)), abs(np.log(nu.max() / nu_ref)))
+    return float(2.0 * abs(beta_min) * x_far)
+
+
 def model_duration_pad_for_priors(single_pulse_fn, priors, n_tau=3.0, n_sigma=3.0, verbose=True):
     """
     Padding (s) for model.setup_model(..., model_duration_pad=...) that holds all the emission the

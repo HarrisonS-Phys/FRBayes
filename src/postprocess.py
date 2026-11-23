@@ -4,11 +4,11 @@ postprocess.py - Tools applied to a fit after it has run.
 Posterior draws: order_pulses relabels the pulses of every draw consistently (the likelihood is a
 sum over unordered pulses, so labels can differ between chains); pointwise_log_lik gives the
 log-likelihood of every observation for every draw, the input to leave-one-out cross-validation
-(PSIS-LOO); and combine_chains groups chains that sampled the same mode (group_chains) and returns
+(loo, PSIS-LOO), which compares fits of the same data; and combine_chains groups chains that sampled the same mode (group_chains) and returns
 the draws of the mode with the highest posterior peak. Residuals: excess_power_search looks for
 signal in a fit's residual that neither noise nor a tolerated model error explains, and
-boxes_explained checks whether a new pulse fitted that leftover signal; the iterative pulse searches
-(run.iterative_pulse_fit, maxL_itfit.maxL_iterative_pulse_fit) use both to decide when to stop.
+boxes_explained checks whether a new pulse fitted that leftover signal; the iterative pulse search
+(run.maxL_iterative_pulse_fit) uses both to decide when to stop.
 """
 
 import numpy as np
@@ -187,25 +187,36 @@ def _psis_log_weights(log_lik_draws, r_eff):
                 lw_u, k_u = array_stats.psislw(log_lik_draws[:, usable], r_eff=r_eff, axis=0)
             lw_u, k_u = np.array(lw_u, dtype=float), np.array(k_u, dtype=float)
             bad = ~(np.all(np.isfinite(lw_u), axis=-1) & np.isfinite(k_u))
-            lw_u[bad], k_u[bad] = tis[usable][bad], np.inf                    # PSIS failed here: flagged
+            lw_u[bad], k_u[bad] = tis[usable][bad], np.inf                    # PSIS failed here: k-hat inf
         except ValueError:                                                     # PSIS failed for all of them
             lw_u, k_u = tis[usable], np.full(usable.sum(), np.inf)
         lw[usable], khat[usable] = lw_u, k_u
     return lw - logsumexp(lw, axis=-1)[:, None], khat
 
 
-def _loo_by_observation(log_lik_draws, r_eff=1.0):
+def loo(log_lik, r_eff=1.0):
     """
-    PSIS-LOO log predictive density of every observation, log p(y_i | y_-i), and the fraction of
-    observations whose Pareto k-hat exceeds 0.7 (above which the estimate for that observation is
-    unreliable). Summed over observations, the first is the ELPD.
+    Leave-one-out cross-validation (PSIS-LOO) of a NUTS fit: how well the fit, made without each
+    observation (one channel at one retained Fourier bin), predicts it, log p(y_i | y_-i), estimated
+    from the posterior draws by Pareto-smoothed importance sampling. The sum over observations, the
+    ELPD, compares fits of the same data (e.g. different numbers of pulses): the higher ELPD
+    predicts better, and a difference is meaningful only if large compared with its standard error,
+    sqrt(n) times the standard deviation over observations of the difference of their pointwise
+    values. Observations whose largest log-likelihoods are equal in every draw, where ArviZ's
+    az.loo would refuse the whole fit, get truncated importance sampling instead (_psis_log_weights).
+    Returns a dict: 'elpd', 'se' (its standard error), 'pointwise' (log p(y_i | y_-i) per
+    observation), 'khat' (Pareto k-hat per observation) and 'frac_khat_bad' (the fraction above
+    0.7, where the estimate for that observation is unreliable).
 
-    log_lik_draws: shape (draws, observations), e.g. pointwise_log_lik flattened over chains
-    r_eff:         relative efficiency of the draws (ESS / draws); 1 is fine for thinned draws
+    log_lik: pointwise_log_lik's output, shape (chains, draws, observations), or (draws, observations)
+    r_eff:   relative efficiency of the draws (ESS / draws); 1 is fine for thinned draws
     """
-    lw, khat = _psis_log_weights(log_lik_draws, r_eff)
-    E = logsumexp(lw + log_lik_draws.T, axis=-1)
-    return E, float(np.mean(khat > 0.7))
+    log_lik = np.asarray(log_lik, dtype=float)
+    log_lik = log_lik.reshape(-1, log_lik.shape[-1])                          # (draws, observations)
+    lw, khat = _psis_log_weights(log_lik, r_eff)
+    pointwise = logsumexp(lw + log_lik.T, axis=-1)
+    return dict(elpd=float(pointwise.sum()), se=float(np.sqrt(pointwise.size) * np.std(pointwise, ddof=1)),
+                pointwise=pointwise, khat=khat, frac_khat_bad=float(np.mean(khat > 0.7)))
 
 
 # -------------------------------------------------------------------
@@ -334,8 +345,8 @@ def combine_chains(samples, log_lik, potential_energy, rhat_max=1.1, near_tie=10
     One posterior from chains that may not have mixed: chains are grouped into modes
     (group_chains), the modes are ranked by their highest log posterior over their draws, and every
     draw of the best mode's chains is returned. With more than one mode a warning says that the
-    choice ignores each mode's width, i.e. its posterior mass, and a second warning flags the
-    result when the runner-up's peak is within near_tie nats of the best. Returns (combined, info):
+    choice ignores each mode's width, i.e. its posterior mass, and a second warning is printed
+    when the runner-up's peak is within near_tie nats of the best. Returns (combined, info):
     a flat dict of arrays shaped (draws, ...), pulses labelled by order_pulses, and a dict with
     'modes' (chain indices, best first), 'peak_log_post' and 'mean_log_lik' (per mode, relative to
     the best), 'gap' (nats from the best peak to the runner-up's, inf with one mode), 'near_tie',
@@ -346,7 +357,7 @@ def combine_chains(samples, log_lik, potential_energy, rhat_max=1.1, near_tie=10
     log_lik:          pointwise_log_lik for the same chains, shape (chains, kept draws, observations)
     potential_energy: minus the log posterior of every draw, shape (chains, draws), from mcmc.get_extra_fields(group_by_chain=True)["potential_energy"]
     rhat_max:         passed to group_chains
-    near_tie:         flag the result when the runner-up's peak log posterior is within this many nats of the best
+    near_tie:         warn when the runner-up's peak log posterior is within this many nats of the best
     verbose:          print the modes, their peaks and the draws returned
     """
     s = order_pulses({k: np.asarray(v) for k, v in samples.items()}, verbose=False)
@@ -377,8 +388,8 @@ def combine_chains(samples, log_lik, potential_energy, rhat_max=1.1, near_tie=10
                   f"{len(chains)} chain(s){' -> kept' if m == 0 else ''}")
         print(f"combine_chains: {len(chain)} draws from mode 0")
     if len(modes) > 1:
-        print(f"warning: mode 0 was chosen by its peak log posterior alone, ignoring each mode's width and so "
-              f"its posterior mass. TO-DO: compare the modes' posterior masses, probably by bridge sampling.")
+        print("warning: mode 0 was chosen by its peak log posterior alone, ignoring each mode's width and so "
+              "its posterior mass. TO-DO: compare the modes' posterior masses, probably by bridge sampling.")
     if near:
         print(f"warning: the runner-up mode's peak is only {gap:.1f} nats below the best (< {near_tie:g}), so "
               f"the modes' widths could reverse their ranking; inspect both.")
@@ -393,14 +404,11 @@ def combine_chains(samples, log_lik, potential_energy, rhat_max=1.1, near_tie=10
 
 def _format_time(box):
     """
-    A box's time extent in ms, with the wrapped part at the end of the segment if it has one.
+    A box's time extent in ms.
 
     box: a box dict from excess_power_search or boxes_explained
     """
-    text = f"{box['t_range'][0] * 1e3:.2f}-{box['t_range'][1] * 1e3:.2f} ms"
-    if box.get("t_wrap"):
-        text += f" + {box['t_wrap'][0] * 1e3:.2f}-{box['t_wrap'][1] * 1e3:.2f} ms (wraps)"
-    return text
+    return f"{box['t_range'][0] * 1e3:.2f}-{box['t_range'][1] * 1e3:.2f} ms"
 
 
 def _dyadic_ranges(n, min_width=1):
@@ -428,8 +436,10 @@ def _cells(X, n_b):
     """
     Complex cells, shape (channels, bands, times): the retained bins of each channel cut into bands
     of n_b consecutive bins, each band inverse-DFT'd (unitary) into n_b time cells; a final partial
-    band is left out. The transform is unitary, so sums of products over cells equal the same sums
-    over the Fourier bins they come from.
+    band is left out. Bin q of a band is first multiplied by exp(i pi q / n_b), a half-cell time
+    shift, so cell j is the band's signal at (j + 1/2) W / n_b and covers [j W / n_b, (j + 1) W / n_b]
+    of the segment of length W, with no cell straddling its ends. The transform is unitary, so sums
+    of products over cells equal the same sums over the Fourier bins they come from.
 
     X:   whitened Fourier-domain array, shape (channels, retained bins)
     n_b: bins per band
@@ -437,7 +447,8 @@ def _cells(X, n_b):
     n_chan, n_ret = X.shape
     n_bands = n_ret // n_b
     bands = X[:, : n_bands * n_b].reshape(n_chan, n_bands, n_b)
-    return np.fft.ifft(bands, axis=-1) * np.sqrt(n_b)
+    half_cell = np.exp(1j * np.pi * np.arange(n_b) / n_b)
+    return np.fft.ifft(bands * half_cell, axis=-1) * np.sqrt(n_b)
 
 
 def _cell_powers(X, n_b):
@@ -488,16 +499,19 @@ def excess_power_search(burst, M_FD, epsilon=0.2, min_snr=0.0, resolutions=None,
     model cell's power is its SNR^2. A box of V cells with residual power E is tested against noise
     plus the largest tolerated misfit, L = epsilon^2 x (the model's power in the box): its p-value
     p_single = P(E' >= E) for E' non-central chi^2 with 2V degrees of freedom and non-centrality L
-    (Patnaik's approximation, exact for L = 0), and a box is significant if p_single times the number
+    (scipy.stats.ncx2, exact), and a box is significant if p_single times the number
     of boxes (Bonferroni, conservative since boxes overlap) is below p_false_alarm and its unexplained
     SNR, sqrt(max(E - 2V - L, 0)), reaches min_snr.
 
-    Significant boxes are then reduced to separate features: taken smallest first, a box is a new
-    feature only if no kept feature's centre lies in its time span and its centre c and width w are
-    clear of every kept feature's, |c - c_k| >= x_min (w + w_k), the repulsion wall's condition
-    (channels play no part, since every pulse spans the band); c and w are the mean and sqrt(2) x the
-    standard deviation over time of the box's unexplained power at full time resolution. Each feature
-    is represented by the most significant box holding its centre and no other feature's.
+    Significant boxes are then reduced to separate features: taken fewest cells first (ties to the
+    smaller p-value, then to the larger unexplained SNR, since p-values below ~1e-308 underflow to
+    0), a box is a new feature only if no kept feature's centre lies in its time span and its centre
+    c and width w are clear of every kept feature's, |c - c_k| >= x_min (w + w_k), the repulsion
+    wall's condition (channels play no part, since every pulse spans the band); c and w are the mean
+    and sqrt(2) x the standard deviation over time of the box's unexplained power at the data's
+    sample spacing. Each feature is represented by the most significant box holding its centre and
+    no other feature's. A box spanning the whole segment says nothing about where its excess is, so
+    it neither starts nor represents a feature unless no other box is significant.
 
     burst:         the ConditionedData the fit used
     M_FD:          the fitted model on the burst's retained Fourier bins (plotting.model_from_draw)
@@ -512,13 +526,12 @@ def excess_power_search(burst, M_FD, epsilon=0.2, min_snr=0.0, resolutions=None,
 
     Returns a dict: 'add_pulse' (p < p_false_alarm and some box significant), 'p' (corrected),
     'n_tiles', 'n_significant', 'tiles' (the separate features, most significant first, or if there
-    are none the `top` strongest boxes, apart in time; each with t_range (s), t_wrap (the part at the
-    end of the segment for a box including the first time cell, else None), channel_range (MHz),
+    are none the `top` strongest boxes, apart in time; each with t_range (s), channel_range (MHz),
     channel_index, band_index, time_index, fourier_band (Hz), significant, n_cells, snr_unexplained,
     snr_residual, snr_model, log10_p_single, resolution, and for features centre and width (s)),
     'epsilon' and 'p_false_alarm'. plotting.plot_residual_tiles draws the boxes.
     """
-    from scipy.stats import chi2
+    from scipy.stats import ncx2
 
     sigma = np.broadcast_to(np.asarray(burst.sigma_noise_fd, dtype=float), np.shape(burst.data_fd))
     Z = (np.asarray(burst.data_fd) - np.asarray(M_FD)) / sigma          # whitened residual
@@ -547,14 +560,10 @@ def excess_power_search(burst, M_FD, epsilon=0.2, min_snr=0.0, resolutions=None,
 
     def make_tile(n_b, c0, c1, b0, b1, t0, t1, e, v, lam, pm, logp):
         """The dict describing one box."""
-        cell = W / n_b
-        lo, hi = (t0 - 0.5) * cell, (t1 - 0.5) * cell
+        cell = W / n_b                                                 # cell m covers [m, m + 1) cells
         k0, k1 = b0 * n_b, b1 * n_b
-        # Cell m is centred at m W / n_b, so cell 0 straddles the start of the segment and wraps to
-        # its end: a box including it also covers [W + lo, W) (the whole segment at n_b = 1)
         return dict(
-            t_range=(max(lo, 0.0), min(hi, W)),
-            t_wrap=(W + lo, W) if lo < 0 else None,
+            t_range=(t0 * cell, t1 * cell),
             channel_range=(float(nu[c0]), float(nu[c1 - 1])),
             channel_index=(int(c0), int(c1)),
             band_index=(int(b0), int(b1)),
@@ -585,8 +594,7 @@ def excess_power_search(burst, M_FD, epsilon=0.2, min_snr=0.0, resolutions=None,
         V = np.broadcast_to((c1 - c0) * (b1 - b0) * (t1 - t0), E.shape)
         L = eps2 * Pm                                                  # tolerated misfit power
         k = 2.0 * V
-        c = (k + 2 * L) / (k + L)                                      # Patnaik: E ~ c chi^2_nu
-        logp = chi2.logsf(E / c, (k + L) ** 2 / (k + 2 * L))
+        logp = ncx2.logsf(E, k, L)                                     # E ~ non-central chi^2_k(L)
 
         def tile_at(i):
             """The box at flat index i of this resolution's arrays."""
@@ -599,23 +607,24 @@ def excess_power_search(burst, M_FD, epsilon=0.2, min_snr=0.0, resolutions=None,
         sig = np.flatnonzero((logp < log_limit) & (E - k - L >= min_snr ** 2))
         significant += [tile_at(i) for i in sig]
 
-    strongest.sort(key=lambda tile: tile["log10_p_single"])
+    def rank(tile):
+        """Most significant first: smaller p-value, then (where p-values underflow to 0) larger unexplained SNR."""
+        return tile["log10_p_single"], -tile["snr_unexplained"]
+
+    strongest.sort(key=rank)
     best = strongest[0]
     p = float(min(1.0, 10.0 ** (best["log10_p_single"] + np.log10(n_tiles))))
 
-    def spans(tile):
-        """The time intervals a box covers, its wrapped part included."""
-        return [tile["t_range"]] + ([tile["t_wrap"]] if tile["t_wrap"] else [])
-
     def in_time(t, tile):
         """Whether time t lies inside the box's time span."""
-        return any(a <= t <= b for a, b in spans(tile))
+        a, b = tile["t_range"]
+        return a <= t <= b
 
     k_full = np.rint(f * n_time * dt).astype(int)
     t_axis = np.arange(n_time) * dt
 
     def centre_width(tile):
-        """Mean and sqrt(2) x spread over the box's times of its unexplained power at full resolution."""
+        """Mean and sqrt(2) x spread over the box's times of its unexplained power at the data's sample spacing."""
         (c0, c1), n_b = tile["channel_index"], tile["resolution"]
         j0, j1 = tile["band_index"][0] * n_b, tile["band_index"][1] * n_b
 
@@ -626,16 +635,21 @@ def excess_power_search(burst, M_FD, epsilon=0.2, min_snr=0.0, resolutions=None,
 
         # Residual power less its noise expectation and the tolerated misfit, clipped at 0
         u = np.maximum(power(Z) - 2.0 * (c1 - c0) * (j1 - j0) / n_time - eps2 * power(Zm), 0.0)
-        u = u * np.any([(t_axis >= a) & (t_axis <= b) for a, b in spans(tile)], axis=0)
+        a, b = tile["t_range"]
+        u = u * ((t_axis >= a) & (t_axis <= b))
         if u.sum() <= 0:
-            a, b = tile["t_range"]
             return 0.5 * (a + b), (b - a) / np.sqrt(12.0)
         mean = np.sum(u * t_axis) / u.sum()
         return float(mean), float(np.sqrt(2.0 * np.sum(u * (t_axis - mean) ** 2) / u.sum()))
 
-    # Which features are separate: smallest significant boxes first, each kept only if clear of those kept
+    # Boxes that may start or represent a feature: not those spanning the whole segment, whose centre
+    # says nothing about where their excess is, unless no other box is significant
+    located = [tile for tile in significant if tile["time_index"] != (0, tile["resolution"])] or significant
+
+    # Which features are separate: significant boxes with the fewest cells first (ties by rank), each
+    # kept only if clear of those kept
     found = []
-    for tile in sorted(significant, key=lambda tile: (tile["n_cells"], tile["log10_p_single"])):
+    for tile in sorted(located, key=lambda tile: (tile["n_cells"],) + rank(tile)):
         if any(in_time(kept["centre"], tile) for kept in found):
             continue
         centre, width = centre_width(tile)
@@ -643,22 +657,23 @@ def excess_power_search(burst, M_FD, epsilon=0.2, min_snr=0.0, resolutions=None,
             found.append(dict(tile, centre=centre, width=width))
 
     # Which box represents each feature: the most significant box holding its centre and no other
-    # feature's (the smallest box itself if none does)
+    # feature's (the feature's own box if none does)
     features = []
     for k, feature in enumerate(found):
         others = [f["centre"] for j, f in enumerate(found) if j != k]
-        own = [tile for tile in significant
+        own = [tile for tile in located
                if in_time(feature["centre"], tile) and not any(in_time(c, tile) for c in others)]
-        best_box = min(own, key=lambda tile: tile["log10_p_single"]) if own else feature
+        best_box = min(own, key=rank) if own else feature
         features.append(dict(best_box, centre=feature["centre"], width=feature["width"]))
-    features.sort(key=lambda tile: tile["log10_p_single"])
+    features.sort(key=rank)
 
     if features:
         tiles = features
     else:
         tiles = []                         # nothing significant: the strongest boxes, apart in time
         for tile in strongest:
-            if not any(x0 < y1 and y0 < x1 for kept in tiles for x0, x1 in spans(tile) for y0, y1 in spans(kept)):
+            (x0, x1) = tile["t_range"]
+            if not any(x0 < kept["t_range"][1] and kept["t_range"][0] < x1 for kept in tiles):
                 tiles.append(tile)
             if len(tiles) == top:
                 break
@@ -682,28 +697,27 @@ def excess_power_search(burst, M_FD, epsilon=0.2, min_snr=0.0, resolutions=None,
     return out
 
 
-def boxes_explained(burst, M_FD_old, M_FD_new, result, min_efficiency=0.5, min_change_snr=5.0,
-                    verbose=True):
+def boxes_explained(burst, M_FD_old, M_FD_new, result, min_gain, verbose=True):
     """
     Did adding a pulse fit the leftover signal that called for it? For each significant box of the
     old fit's excess_power_search, with whitened old residual r and model change D = M_new - M_old
-    summed over the box's cells, the efficiency eta = (sum |r|^2 - sum |r - D|^2) / sum |D|^2
-    = 2 a - 1, a the least-squares amplitude of D fitted to r: ~1 if the change matches leftover
-    signal, ~-1 if it lands on noise, and (1 - e^2) / (1 + e^2) for a core misfit by a fraction e (so
-    the default 0.5 admits misfits up to ~55%). A box is explained if eta >= min_efficiency and the
-    model changed by at least min_change_snr there; the idea is that of the chi^2 consistency test of
-    gravitational-wave searches (Allen 2005). The iterative searches accept a new pulse only if it
-    explains at least one box. Returns a dict: 'any_removed', and 'boxes', each with t_range, t_wrap,
-    channel_range, channel_index, snr_before (unexplained SNR in the search), change_snr
-    (sqrt(sum |D|^2)), efficiency and removed (explained).
+    in the box's cells, the drop in leftover power is drop = sum |r|^2 - sum |r - D|^2
+    = 2 Re sum conj(r) D - sum |D|^2, the box's share of the chi^2 gain (twice the log-likelihood
+    gain), measured with the search's own power statistic. A box is explained if its share of the
+    log-likelihood gain, drop / 2, is at least min_gain, the same threshold the iterative search
+    applies to the whole fit, so the significant box alone must account for the gain a new pulse has to
+    earn; for a change unrelated to the leftover the drop averages -sum |D|^2 with spread
+    2 sqrt(sum |D|^2), so noise rarely passes. The iterative search accepts a new pulse only if it
+    explains at least one box. Returns a dict: 'any_removed', and 'boxes', each with
+    t_range, channel_range, channel_index, snr_before (unexplained SNR in the search), gain
+    (drop / 2), change_snr (sqrt(sum |D|^2)) and removed (explained).
 
-    burst:          the ConditionedData both fits used
-    M_FD_old:       the old fit's model, the one `result` was computed for
-    M_FD_new:       the new fit's model, normally with one more pulse
-    result:         the dict excess_power_search returned for the old fit
-    min_efficiency: efficiency a box needs to count as explained
-    min_change_snr: model change (SNR) a box needs to count as explained; below it the efficiency is mostly noise
-    verbose:        print each box
+    burst:        the ConditionedData both fits used
+    M_FD_old:     the old fit's model, the one `result` was computed for
+    M_FD_new:     the new fit's model, normally with one more pulse
+    result:       the dict excess_power_search returned for the old fit
+    min_gain:     log-likelihood gain a box needs to count as explained; pass the iterative search's threshold
+    verbose:      print each box
     """
     log10_limit = np.log10(result["p_false_alarm"]) - np.log10(result["n_tiles"])
     sigma = np.broadcast_to(np.asarray(burst.sigma_noise_fd, dtype=float), np.shape(burst.data_fd))
@@ -721,23 +735,19 @@ def boxes_explained(burst, M_FD_old, M_FD_new, result, min_efficiency=0.5, min_c
         r = _cells(R_old, n_b)[c0:c1, b0:b1, t0:t1]
         d = _cells(D, n_b)[c0:c1, b0:b1, t0:t1]
         change = float(np.sum(np.abs(d) ** 2))
-        eff = (2.0 * float(np.real(np.sum(np.conj(r) * d))) / change - 1.0) if change > 0 else np.nan
-        removed = change >= min_change_snr ** 2 and eff >= min_efficiency
+        drop = float(np.sum(np.abs(r) ** 2) - np.sum(np.abs(r - d) ** 2))
         boxes.append(dict(t_range=t["t_range"], channel_range=t["channel_range"],
-                          channel_index=t["channel_index"], t_wrap=t.get("t_wrap"),
-                          snr_before=t["snr_unexplained"], change_snr=float(np.sqrt(change)),
-                          efficiency=float(eff), removed=bool(removed)))
+                          channel_index=t["channel_index"], snr_before=t["snr_unexplained"], gain=drop / 2.0,
+                          change_snr=float(np.sqrt(change)), removed=bool(drop / 2.0 >= min_gain)))
 
     out = dict(any_removed=any(b["removed"] for b in boxes), boxes=boxes)
     if verbose:
         if not boxes:
             print("boxes_explained: the old result has no significant box")
         for b in boxes:
-            why = ("explained" if b["removed"] else
-                   f"untouched (model change SNR < {min_change_snr:g})" if b["change_snr"] < min_change_snr
-                   else "not explained")
             print(f"box {_format_time(b)}, "
                   f"{b['channel_range'][0]:.0f}-{b['channel_range'][1]:.0f} MHz (SNR {b['snr_before']:.1f}): "
-                  f"model change SNR {b['change_snr']:.1f}, efficiency {b['efficiency']:+.2f} -> {why}")
+                  f"ln L gain in the box {b['gain']:.1f} (need {min_gain:g}), "
+                  f"model change SNR {b['change_snr']:.1f} -> {'explained' if b['removed'] else 'not explained'}")
         print(f"  -> {'the new pulse fits leftover signal' if out['any_removed'] else 'the new pulse fits none of the leftover signal'}")
     return out
