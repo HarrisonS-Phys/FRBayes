@@ -48,7 +48,7 @@ def order_pulses(samples, by="mean_arrival_time", descending=False, pair_sites=P
     pair_sites:  names of per-pair sites, named explicitly because with three pulses a per-pair site has the length of a per-pulse one
     exclude:     names of sites to leave untouched, for an axis that only happens to have length n_pulses
     return_perm: also return the permutation, shape (..., n_pulses)
-    verbose:     print which sites were permuted and which were left alone
+    verbose:     print the ordering and any sites left unchanged
     """
     samples = {k: np.asarray(v) for k, v in samples.items()}
     if by not in samples:
@@ -90,10 +90,8 @@ def order_pulses(samples, by="mean_arrival_time", descending=False, pair_sites=P
             out[name] = x.copy(); done["unchanged"].append(name)
 
     if verbose:
-        print(f"order_pulses: {n_pulses} pulses ordered by {by} ({'descending' if descending else 'ascending'}).")
-        for kind, names in done.items():
-            if names:
-                print(f"  {kind}: {', '.join(names)}")
+        print(f"order_pulses: {n_pulses} pulses ordered by {by} ({'descending' if descending else 'ascending'})"
+              + (f"; left unchanged: {', '.join(done['unchanged'])}" if done["unchanged"] else ""))
     return (out, perm) if return_perm else out
 
 
@@ -358,7 +356,7 @@ def combine_chains(samples, log_lik, potential_energy, rhat_max=1.1, near_tie=10
     potential_energy: minus the log posterior of every draw, shape (chains, draws), from mcmc.get_extra_fields(group_by_chain=True)["potential_energy"]
     rhat_max:         passed to group_chains
     near_tie:         warn when the runner-up's peak log posterior is within this many nats of the best
-    verbose:          print the modes, their peaks and the draws returned
+    verbose:          print each mode's chains, peak and mean log-likelihood, and the draws returned
     """
     s = order_pulses({k: np.asarray(v) for k, v in samples.items()}, verbose=False)
     L = np.asarray(log_lik, dtype=float)
@@ -366,7 +364,7 @@ def combine_chains(samples, log_lik, potential_energy, rhat_max=1.1, near_tie=10
     n_chains, n_per = s["mean_arrival_time"].shape[:2]
     if U.shape[:2] != (n_chains, n_per):
         raise ValueError(f"potential_energy has shape {U.shape}; expected ({n_chains}, {n_per}).")
-    modes, rhat = group_chains(s, L, rhat_max=rhat_max, verbose=verbose)
+    modes, rhat = group_chains(s, L, rhat_max=rhat_max, verbose=False)
 
     # Rank modes by their highest log posterior, best first
     peak = np.array([-U[m].min() for m in modes])
@@ -383,10 +381,13 @@ def combine_chains(samples, log_lik, potential_energy, rhat_max=1.1, near_tie=10
     combined = {k: v[chain, draw] for k, v in s.items() if v.ndim >= 2 and v.shape[:2] == (n_chains, n_per)}
 
     if verbose:
+        print(f"combine_chains: {n_chains} chains -> {len(modes)} mode(s) (pairs linked where every "
+              f"R-hat < {rhat_max:g})")
         for m, chains in enumerate(modes):
-            print(f"  mode {m}: peak log post {peak[m]:+.1f}, mean log-lik {mean_ll[m]:+.1f}, "
-                  f"{len(chains)} chain(s){' -> kept' if m == 0 else ''}")
-        print(f"combine_chains: {len(chain)} draws from mode 0")
+            within = max((rhat[a, b] for a in chains for b in chains if a < b), default=0.0)
+            print(f"  mode {m}: chains {chains}" + (f" (largest R-hat within {within:.3f})" if len(chains) > 1 else "")
+                  + f", peak log post {peak[m]:+.1f}, mean log-lik {mean_ll[m]:+.1f}"
+                  + (f" -> kept, {len(chain)} draws" if m == 0 else ""))
     if len(modes) > 1:
         print("warning: mode 0 was chosen by its peak log posterior alone, ignoring each mode's width and so "
               "its posterior mass. TO-DO: compare the modes' posterior masses, probably by bridge sampling.")
@@ -686,14 +687,13 @@ def excess_power_search(burst, M_FD, epsilon=0.2, min_snr=0.0, resolutions=None,
         print(f"Residual test (tolerating {epsilon:.0%} model error): {'ADD A PULSE' if add else 'stop'} "
               f"(p = {p:.2g} after {n_tiles} boxes" + (f"; min_snr {min_snr:g}" if min_snr else "") + ")")
         if features:
-            print(f"  {len(significant)} boxes significant on their own, making {len(features)} separate feature(s):")
-        else:
-            print("  nothing significant; strongest box:")
-        for t in tiles if features else tiles[:1]:
-            where = (f", centre {t['centre'] * 1e3:.2f} ms, width {t['width'] * 1e3:.2f} ms" if "centre" in t else "")
-            print(f"    {_format_time(t)}, {t['channel_range'][0]:.0f}-{t['channel_range'][1]:.0f} MHz: "
-                  f"unexplained SNR {t['snr_unexplained']:.1f} (residual {t['snr_residual']:.1f}, "
-                  f"model {t['snr_model']:.1f}){where}")
+            snr = ", ".join(f"{t['snr_unexplained']:.1f}" for t in tiles)
+            print(f"  {len(features)} feature(s) from {len(significant)} significant boxes; unexplained SNR [{snr}]")
+        elif tiles:
+            t = tiles[0]
+            print(f"  nothing significant; strongest box {_format_time(t)}, "
+                  f"{t['channel_range'][0]:.0f}-{t['channel_range'][1]:.0f} MHz: unexplained SNR "
+                  f"{t['snr_unexplained']:.1f}")
     return out
 
 
@@ -717,7 +717,7 @@ def boxes_explained(burst, M_FD_old, M_FD_new, result, min_gain, verbose=True):
     M_FD_new:     the new fit's model, normally with one more pulse
     result:       the dict excess_power_search returned for the old fit
     min_gain:     log-likelihood gain a box needs to count as explained; pass the iterative search's threshold
-    verbose:      print each box
+    verbose:      print the gain in each box and how many are explained
     """
     log10_limit = np.log10(result["p_false_alarm"]) - np.log10(result["n_tiles"])
     sigma = np.broadcast_to(np.asarray(burst.sigma_noise_fd, dtype=float), np.shape(burst.data_fd))
@@ -744,10 +744,8 @@ def boxes_explained(burst, M_FD_old, M_FD_new, result, min_gain, verbose=True):
     if verbose:
         if not boxes:
             print("boxes_explained: the old result has no significant box")
-        for b in boxes:
-            print(f"box {_format_time(b)}, "
-                  f"{b['channel_range'][0]:.0f}-{b['channel_range'][1]:.0f} MHz (SNR {b['snr_before']:.1f}): "
-                  f"ln L gain in the box {b['gain']:.1f} (need {min_gain:g}), "
-                  f"model change SNR {b['change_snr']:.1f} -> {'explained' if b['removed'] else 'not explained'}")
-        print(f"  -> {'the new pulse fits leftover signal' if out['any_removed'] else 'the new pulse fits none of the leftover signal'}")
+        else:
+            gains = ", ".join(f"{b['gain']:.1f}" for b in boxes)
+            print(f"  ln L gain per box [{gains}] (need {min_gain:g}): "
+                  f"{sum(b['removed'] for b in boxes)} of {len(boxes)} explained")
     return out

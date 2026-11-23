@@ -641,9 +641,11 @@ def run_fit(
         # JAX has no global random state, so draw a seed and keep it, so the run can be repeated exactly
         seed = int(np.random.default_rng().integers(2**31 - 1))
     amplitude = "fluence in units of SNR as A_snr" if "A_snr" in priors else "fluence as A"
+    same_priors = maxL_start is not None and describe_priors(best["priors"]) == describe_priors(priors)
     print(f"run_fit: likelihood {getattr(likelihood, '__name__', likelihood)}, parameterizing {amplitude}, "
-          f"seed {seed}; priors:")
-    _print_priors(priors, indent="  ")
+          f"seed {seed}; priors" + (" as in the maxL fit" if same_priors else ":"))
+    if not same_priors:
+        _print_priors(priors, indent="  ")
     if maxL_start is None:
         _announce_delta_init(priors)              # with maxL_start, delta starts at the maxL value instead
 
@@ -813,7 +815,7 @@ def maxL_fit(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlik
     tau_zero_dt_scale:  the effectively-zero tau_ref value added below the log grid, in units of dt; None leaves it out
     tau_parallel:       run all tau_ref values at once (memory x number of values) instead of one after another
     seed:               integer the random starts are drawn from
-    verbose:            print the best fit, the profile and the best run's tau_ref
+    verbose:            print the likelihood (not for a fit warm-started from prev, a later step of a search that printed it) and the best fit, with its tau_ref
     likelihood_kwargs:  passed straight to the likelihood, e.g. repulsion={...}
     """
     from plotting import model_from_draw
@@ -822,8 +824,9 @@ def maxL_fit(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlik
     n_warm = num_starts // 2 if n_warm is None else n_warm
     model_kwargs = _model_kwargs(burst, single_pulse_fn, priors, n_pulses, shared_params, likelihood_kwargs)
     if verbose:
-        amplitude = "fluence in units of SNR as A_snr" if "A_snr" in priors else "fluence as A"
-        print(f"maxL_fit: likelihood {getattr(likelihood, '__name__', likelihood)}, parameterizing {amplitude}")
+        if prev is None:                          # a warm-started fit is a later step of a search that said it already
+            amplitude = "fluence in units of SNR as A_snr" if "A_snr" in priors else "fluence as A"
+            print(f"maxL_fit: likelihood {getattr(likelihood, '__name__', likelihood)}, parameterizing {amplitude}")
         _announce_delta_init(priors, warm=prev is not None)
     z0, init_times, init_sigma = _starts(burst, single_pulse_fn, priors, likelihood, n_pulses, num_starts, n_warm,
                                          model_kwargs, likelihood_kwargs, seed, prev, search, split_starts,
@@ -907,11 +910,9 @@ def maxL_fit(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlik
         near = int(np.sum(-f_end >= logL - 1.0))
         kind = "warm" if prev is not None and best < n_warm else "random"
         print(f"maxL_fit: {n_pulses} pulse(s), {num_starts} starts ({n_warm if prev is not None else 0} warm)"
-              f" x {len(tau_grid)} tau values: best ln L + repulsion = {logL:.1f} (start {best}, {kind}); "
+              f" x {len(tau_grid)} tau values: best ln L + repulsion = {logL:.1f} at tau_ref = "
+              f"{float(values[TAU_SITE]) * 1e6:.3g} \u00b5s (start {best}, {kind}); "
               f"{near} start(s) within 1 nat; {seconds:.0f} s")
-        print("  tau profile (tau_ref held fixed):   " + "  ".join(
-            f"{t * 1e6:.3g}us:{p:.1f}" for t, p in zip(tau_grid, profile)))
-        print(f"  best run: tau_ref {float(values[TAU_SITE]) * 1e6:.1f} us after release")
     return out
 
 

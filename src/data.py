@@ -270,9 +270,8 @@ def truncation_check(burst, data_fd_all, boxes, n_sigma=3.0, verbose=True):
     noise_above = 2.0 * np.sqrt(n_above)
     too_few = bool(gain > 1.0 and above > n_sigma * noise_above)
     if verbose:
-        print(f"Fourier truncation check: in the significant boxes, SNR {snr_kept:.1f} in the retained bins, "
-              f"{snr_all:.1f} with every bin (gain {gain:.2f}); excess power above the cut {above:.0f}, "
-              f"noise sd {noise_above:.0f}")
+        print(f"Fourier truncation check: burst SNR in the significant boxes {snr_kept:.1f} with the kept bins, "
+              f"{snr_all:.1f} with every bin")
     if too_few:
         warnings.warn(f"the bins above the Fourier cut hold part of the burst: keeping them would raise its SNR "
                       f"from {snr_kept:.1f} to {snr_all:.1f}. Prepare the burst with a smaller fd_downsample.")
@@ -389,16 +388,15 @@ def prepare_burst(path, event_id=None, n_avg=8, fd_downsample=4, toa=None, exclu
 
     boxes = significant_boxes(burst)
     box_weights = box_channel_weights(burst, boxes)
-    if box_weights is None:
-        if verbose:
-            print("no significant box in the data: channel weights from every retained bin instead")
-    else:
+    if box_weights is not None:
         channel_weights = box_weights
         freq_channels_ref = dispersion_orthogonal_reference(freq, channel_weights)
         burst = replace(burst, channel_weights=channel_weights, freq_channels_ref=freq_channels_ref)
     if verbose:
-        print((f"channel weights from {len(boxes)} significant box(es) of an excess-power search of the data; "
-               if boxes else "") + f"weighted mean frequency {float(jnp.sum(channel_weights * jnp.asarray(freq))):.1f} MHz, "
-              f"reference frequency {freq_channels_ref:.1f} MHz")
+        mean_freq = float(jnp.sum(channel_weights * jnp.asarray(freq)))
+        source = (f"by their signal in {len(boxes)} significant box(es)" if box_weights is not None
+                  else "by their signal in every retained bin, as no box is significant")
+        print(f"reference frequency {freq_channels_ref:.1f} MHz (channels weighted {source}; weighted mean "
+              f"{mean_freq:.1f} MHz)")
     truncation_check(burst, data_fd_all, boxes, verbose=verbose)
     return burst
