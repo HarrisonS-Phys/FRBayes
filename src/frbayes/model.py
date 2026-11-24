@@ -59,6 +59,21 @@ class FDGrid:
     smear_runs: dict = None  # constants of intra-channel smearing, from _smearing_runs; None without it
 
 
+def _dirichlet(x, n):
+    """
+    D_n(x) = sin(pi n x) / (n sin(pi x)), the Fourier transform of n unit impulses spaced by 1,
+    averaged: the comb of n raw channels' delays. Near integer x, where sin(pi x) vanishes, it
+    takes the limit cos(pi n x) / cos(pi x).
+
+    x: the spacing of the impulses times the Fourier frequency
+    n: the number of impulses (a positive integer, as a float array broadcasting with x)
+    """
+    s = jnp.sin(jnp.pi * x)
+    small = jnp.abs(s) < 1e-4
+    ratio = jnp.sin(jnp.pi * n * x) / (n * jnp.where(small, 1.0, s))
+    return jnp.where(small, jnp.cos(jnp.pi * n * x) / jnp.cos(jnp.pi * x), ratio)
+
+
 def _smearing_runs(freqs_channels, constants):
     """
     The constants of intra-channel dispersion smearing. Each channel's members (the raw channels
@@ -69,8 +84,9 @@ def _smearing_runs(freqs_channels, constants):
     delays per unit k_DM DM; 'offset', 1 / (nu_lo nu_hi) - nu_a^-2, its mean delay (the average of
     nu^-2 over the run) less that at the channel centre; and, for incoherent dedispersion, which
     aligns raw channels at their own centres nu_m, the same two quantities for one raw channel
-    at the run's centre, 'raw_width' and 'raw_offset'. Runs are padded with zero weight to the
-    most any channel has. Computed in float64 and returned as (n_chan, n_runs, 1) float32 arrays,
+    at the run's centre, 'raw_width' and 'raw_offset'; and 'n_raw', its number of raw channels. Runs
+    are padded with zero weight (and n_raw = 1) to the most any channel has. Computed in float64
+    and returned as (n_chan, n_runs, 1) float32 arrays,
     with 'multi', the indices of the channels with more than one run (those straddling bad
     channels); None without freq_members.
 
@@ -86,8 +102,9 @@ def _smearing_runs(freqs_channels, constants):
         raise ValueError(f"freq_members has {members.shape[0]} rows but there are {nu_a.size} channels.")
     runs = [np.split(m, np.where(np.diff(m) > 1.5 * dnu)[0] + 1) for m in members]   # split at gaps
     n_runs = max(len(r) for r in runs)
-    names = ("weight", "width", "offset", "raw_width", "raw_offset")
+    names = ("weight", "width", "offset", "raw_width", "raw_offset", "n_raw")
     out = {name: np.zeros((nu_a.size, n_runs)) for name in names}
+    out["n_raw"][:] = 1.0                                   # padding runs: zero weight, and no 0 / 0 below
     for c, channel_runs in enumerate(runs):
         for r, run in enumerate(channel_runs):
             lo, hi = run.min() - 0.5 * dnu, run.max() + 0.5 * dnu
@@ -97,6 +114,7 @@ def _smearing_runs(freqs_channels, constants):
             out["offset"][c, r] = 1.0 / (lo * hi) - nu_a[c] ** -2
             out["raw_width"][c, r] = (mid - 0.5 * dnu) ** -2 - (mid + 0.5 * dnu) ** -2
             out["raw_offset"][c, r] = 1.0 / ((mid - 0.5 * dnu) * (mid + 0.5 * dnu)) - mid ** -2
+            out["n_raw"][c, r] = run.size
     result = {name: jnp.asarray(v[..., None], dtype=jnp.float32) for name, v in out.items()}
     result["multi"] = np.array([c for c, channel_runs in enumerate(runs) if len(channel_runs) > 1], dtype=int)
     return result
@@ -227,25 +245,32 @@ def shared_transfer_fd(params_dict: dict, grid: FDGrid, constants: ModelConstant
         DM_inc = jnp.float32(constants.DM_incoherent)
         shift = k_DM * (DM * runs["offset"] + DM_inc * runs["raw_offset"])   # each run's mean delay, (n_chan, n_runs, 1)
 
-        def spread(width, raw_width, f):
-            """The run's boxcars in the Fourier domain: residual DM across it, DM_inc across a raw channel."""
-            out = jnp.sinc(f * k_DM * DM * width)
-            if constants.DM_incoherent != 0:
-                out = out * jnp.sinc(f * k_DM * DM_inc * raw_width)
-            return out
+        def spread(width, raw_width, n_raw, f):
+            """
+            The run's smearing in the Fourier domain. Its n raw channels are n copies of one raw
+            channel's sweep, of width DM (width / n) + DM_inc raw_width, with the residual DM
+            spacing them by DM (width / n): D_n(f k DM width / n) sinc(f k (DM width / n + DM_inc
+            raw_width)). With DM_inc = 0 that is one boxcar over the whole run, sinc(f k DM width).
+            """
+            if constants.DM_incoherent == 0:
+                return jnp.sinc(f * k_DM * DM * width)
+            step = width / n_raw
+            return (_dirichlet(f * k_DM * DM * step, n_raw)
+                    * jnp.sinc(f * k_DM * (DM * step + DM_inc * raw_width)))
 
         # Every channel's first run: its mean-delay shift moves the whole template, so it joins the
         # channel's delay in the phase computed below instead of needing a phase of its own
         delay_a = delay_a + shift[:, 0, :]
         smear = runs["weight"][:, 0, :] * spread(runs["width"][:, 0, :], runs["raw_width"][:, 0, :],
-                                                 grid.fourier_freqs)
+                                                 runs["n_raw"][:, 0, :], grid.fourier_freqs)
         # The other runs exist only in the few channels straddling bad channels, so they are
         # computed for those alone, each with its delay relative to the first run
         multi = runs["multi"]
         if multi.size:
             f = grid.fourier_freqs[None]                                 # (1, 1, n_fourier)
             extra = jnp.sum(runs["weight"][multi, 1:]
-                            * spread(runs["width"][multi, 1:], runs["raw_width"][multi, 1:], f)
+                            * spread(runs["width"][multi, 1:], runs["raw_width"][multi, 1:],
+                                     runs["n_raw"][multi, 1:], f)
                             * jnp.exp(-2j * jnp.pi * f * (shift[multi, 1:] - shift[multi, :1])), axis=1)
             smear = smear.astype(jnp.complex64).at[multi].add(extra)
 
@@ -266,14 +291,16 @@ def scattered_gaussian_fd_pulse(params_dict: dict, grid: FDGrid, constants: Mode
                x S_ac x sinc(f_c dt) exp(i pi f_c dt),
 
     with sinc(x) = sin(pi x) / (pi x) and mu_a = t + k_DM DM (nu_a^-2 - nu_r^-2) - t_start. Each run r
-    of adjacent raw channels in channel a (_smearing_runs) spreads the residual DM's delays over a
-    boxcar centred on the run's mean delay, and with incoherent dedispersion each raw channel is
-    further spread by DM_inc over its own width:
+    of n adjacent raw channels in channel a (_smearing_runs) is n copies of one raw channel's sweep,
+    of width DM W_ar / n + DM_inc V_ar (the residual DM, and with incoherent dedispersion the DM
+    removed only incoherently), spaced by the residual DM's delay between neighbours, DM W_ar / n:
 
-        S_ac = sum_r w_ar sinc(f_c k_DM DM W_ar) sinc(f_c k_DM DM_inc V_ar)
+        S_ac = sum_r w_ar D_n(f_c k_DM DM W_ar / n) sinc(f_c k_DM (DM W_ar / n + DM_inc V_ar))
                x exp(-2 pi i f_c k_DM (DM O_ar + DM_inc P_ar)),
 
-    with w, W, O, V and P the run's 'weight', 'width', 'offset', 'raw_width' and 'raw_offset'. It is
+    with D_n(x) = sin(pi n x) / (n sin(pi x)) and w, W, O, V, P and n the run's 'weight', 'width',
+    'offset', 'raw_width', 'raw_offset' and 'n_raw'. With DM_inc = 0 a run is one boxcar,
+    D_n(x) sinc(x) = sinc(n x), so S_ac = sum_r w_ar sinc(f_c k_DM DM W_ar) exp(-2 pi i f_c k_DM DM O_ar). It is
     computed as gaussian_arrival_fd x shared_transfer_fd: the first holds everything that differs
     between pulses whose DM and scattering are shared, the second everything that does not, so a
     burst of such pulses can build the second once (likelihood.FD_gaussianlikelihood).

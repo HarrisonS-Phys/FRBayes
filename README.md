@@ -8,8 +8,9 @@ Bayesian parameter estimation for fast radio bursts, with JAX and NumPyro. FRBay
 multi-pulse model of a dedispersed dynamic spectrum in the Fourier domain: a maximum-likelihood
 search finds the number of pulses, and NUTS samples the posterior of every pulse's arrival time,
 width, spectrum and fluence, and of the scattering time and residual DM, which the pulses share by
-default. It is built for an NVIDIA GPU; it also runs on a CPU, but much more slowly, so the CPU
-suits small tests rather than real fits.
+default. FRBayes can fit both baseband data, coherently dedispersed, and L1 intensity data,
+incoherently dedispersed. It is built for an NVIDIA GPU; it also runs on a CPU, but much more
+slowly, so the CPU suits small tests rather than real fits.
 
 ## Requirements
 
@@ -124,10 +125,18 @@ for every burst.
 
 ## Usage
 
-`examples/tutorial.ipynb` walks through a full fit, from loading the data to saving the posterior,
-on the example bursts in `examples/data/`. `examples/format_BB_data.ipynb` dedisperses baseband data
-and writes it in the `.npz` format above, ready for FRBayes. Every function's docstring describes its
-arguments.
+The examples demonstrate fitting baseband data, on the CHIME/FRB burst FRB 20181221A. Its data file
+is not included in the repository, so run the two notebooks in this order:
+
+1. `examples/notebooks/dedisperse_baseband.ipynb` coherently dedisperses the burst's CHIME/FRB
+   baseband data and writes it to `examples/data/` in the `.npz` format above. It needs the
+   CHIME/FRB `baseband_analysis` package and access to the CHIME/FRB baseband files.
+2. `examples/notebooks/tutorial.ipynb` then walks through a full fit of that file, from loading the
+   data to saving the posterior.
+
+L1 intensity data are fitted the same way, except that the model constant `DM_incoherent` (step 5 of
+the tutorial) is the DM the data were dedispersed with, not 0, so that the smearing within each
+channel is modelled. Every function's docstring describes its arguments.
 
 ## Known limitations
 
@@ -143,6 +152,8 @@ arguments.
 - A parameter whose posterior sits against a prior bound (an unresolved width at the narrowest
   allowed value, or a scattering time at the longest the window allows) is not flagged
   automatically; such values are limits, not measurements.
+- Fitted arrival times are measured from the start of the data segment. The segment's start time is
+  not kept, so they cannot yet be converted to absolute times.
 
 ## License
 
