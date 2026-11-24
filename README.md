@@ -15,27 +15,34 @@ slowly, so the CPU suits small tests rather than real fits.
 ## Requirements
 
 - Linux, with Python 3.13
+- git, to install from GitHub
 - An NVIDIA GPU with a driver that supports CUDA 12, **highly recommended**: the fits are written
   for it, and run much more slowly on a CPU. The CUDA libraries themselves are installed by the
   `gpu` extra; nothing else needs installing system-wide.
 
 ## Installation
 
-### From PyPI
+### From GitHub
+
+FRBayes is not on PyPI yet; it is installed straight from its GitHub repository. `@v0.1.0` at the
+end of each command installs that release.
 
 In a project managed with [uv](https://docs.astral.sh/uv/) (create one with `uv init`):
 
 ```bash
-uv add "frbayes[gpu]"          # NVIDIA GPU (recommended)
-uv add frbayes                 # CPU only
+uv add "frbayes[gpu] @ git+https://github.com/HarrisonS-Phys/FRBayes@v0.1.0"    # NVIDIA GPU (recommended)
+uv add "frbayes @ git+https://github.com/HarrisonS-Phys/FRBayes@v0.1.0"         # CPU only
 ```
 
 In an environment uv does not manage, such as a conda environment or a plain virtual environment:
 
 ```bash
-pip install "frbayes[gpu]"     # NVIDIA GPU (recommended)
-pip install frbayes            # CPU only
+pip install "frbayes[gpu] @ git+https://github.com/HarrisonS-Phys/FRBayes@v0.1.0"    # NVIDIA GPU (recommended)
+pip install "frbayes @ git+https://github.com/HarrisonS-Phys/FRBayes@v0.1.0"         # CPU only
 ```
+
+If the repository is private, you need access to it, and git must be able to sign in to GitHub; to
+use an SSH key, write `git+ssh://git@github.com/<owner>/FRBayes@v0.1.0` instead.
 
 Use one tool per environment. In a uv project, add packages only with `uv add`: `uv sync` makes the
 project's environment match its lockfile exactly, so anything installed there with `pip` is removed
@@ -47,7 +54,7 @@ CUDA libraries that install only on Linux with an NVIDIA GPU.
 ### From source, for development
 
 ```bash
-git clone <repository URL> FRBayes
+git clone https://github.com/<owner>/FRBayes
 cd FRBayes
 uv sync --extra gpu --extra dev     # leave out --extra gpu on a machine without an NVIDIA GPU
 ```
