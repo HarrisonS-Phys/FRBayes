@@ -120,8 +120,10 @@ for every burst.
 
 ## Usage
 
-The example notebook in `examples/` walks through a full fit, from loading the data to saving the
-posterior. Every function's docstring describes its arguments.
+`examples/tutorial.ipynb` walks through a full fit, from loading the data to saving the posterior,
+on the example bursts in `examples/data/`. `examples/format_BB_data.ipynb` dedisperses baseband data
+and writes it in the `.npz` format above, ready for FRBayes. Every function's docstring describes its
+arguments.
 
 ## Known limitations
 
