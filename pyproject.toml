@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,18 +7,21 @@ name = "FRBayes"
 version = "0.1.0"
 description = "Bayesian parameter estimation for Fast Radio Bursts using JAX and NumPyro"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.13,<3.14"
 dependencies = [
-    "jax",
-    "jaxlib",
-    "numpyro",
-    "numpy",
-    "scipy",
-    "matplotlib",
+    "jax>=0.11.2",
+    "jaxlib>=0.11.2",
+    "numpyro>=0.22.0",
+    "numpy>=2.5.4",
+    "scipy>=1.18.1",
+    "matplotlib>=3.11.2",
     "h5py>=3.16.0",
-    "seaborn>=0.13.2",
-    "arviz>=0.23.4",
-    "ipykernel>=7.3.0",
+    "arviz>=1.3.0",
+    "arviz-base>=1.3.1",
+    "arviz-stats>=1.3.3",
+    "xarray>=2026.9.0",
     "h5netcdf>=1.8.1",
     "optax>=0.2.8",
 ]
@@ -28,6 +31,8 @@ dev = [
     "pytest",
     "jupyter",
     "ruff",
+    "seaborn>=0.13.2",
+    "ipykernel>=7.3.0",
 ]
 gpu = ["jax[cuda12]"]
 
