@@ -75,7 +75,7 @@ def set_priors(
     band:            (bottom, top) of the telescope's band (MHz), for the gamma bound; needed unless gamma_range is given
     gamma_range:     (low, high) of the spectral index prior; None sets it from band (priors.spectral_index_bound)
     beta_range:      (low, high) of the spectral running prior
-    verbose:         print the width bounds and every prior
+    verbose:         print every prior
     overrides:       name=distribution replaces a default or adds a parameter (e.g. A=..., delta=...); name=None removes a default
     """
     W_seg = burst.n_time * burst.dt
@@ -83,7 +83,8 @@ def set_priors(
         toa = 0.5 * W_seg
 
     # The tau_ref cap depends on the scattering index, which an override may make a sampled 'delta'
-    width = width_prior_bounds(burst, single_pulse_fn, toa, delta_prior=overrides.get("delta"), verbose=verbose)
+    width = width_prior_bounds(burst, single_pulse_fn, toa, delta_prior=overrides.get("delta"),
+                               verbose=False)       # the bounds are printed with every prior below
     dm = dispersion_prior_bounds(burst, single_pulse_fn)
 
     # gamma's bound comes from the lowest beta allowed, an override's if beta is overridden
@@ -810,7 +811,7 @@ def run_maxL(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlik
              n_warm=None, prev=None, search=None, split_starts=True, box_spectrum=True,
              shared_params=("DM", "tau_ref"), n_adam=1000, lr=0.05, lr_decay=0.01, tau_profile=8,
              n_polish=500, lr_polish=0.01, tau_floor_dt_scale=0.1, tau_zero_dt_scale=1e-3, tau_parallel=False,
-             seed=0, verbose=True, **likelihood_kwargs):
+             seed=None, verbose=True, **likelihood_kwargs):
     """
     Maximum-likelihood fit of n_pulses pulses. From each of num_starts starting points (warm and
     random starts, _starts), it maximizes the log-likelihood plus
@@ -828,8 +829,8 @@ def run_maxL(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlik
     constrained), 'map' (every site at the best point), 'post' (the same with a leading draw axis
     of 1, for plotting.model_from_draw), 'M' (the best model), 'z' (the best unconstrained point),
     'priors', 'init_times', 'init_sigma', 'seconds', 'tau_grid', 'profile' (best ln L with tau_ref
-    held at each grid value), 'logL_runs' (n_tau, num_starts) and 'tau_end_runs' (tau_ref at the end
-    of each run, after release).
+    held at each grid value), 'logL_runs' (n_tau, num_starts), 'tau_end_runs' (tau_ref at the end
+    of each run, after release) and 'seed'.
 
     burst:              the ConditionedData of the burst
     single_pulse_fn:    the model closure from model.setup_model
@@ -852,7 +853,7 @@ def run_maxL(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlik
     tau_floor_dt_scale: lowest log-spaced tau_ref value, in units of the sample time dt
     tau_zero_dt_scale:  the effectively-zero tau_ref value added below the log grid, in units of dt; None leaves it out
     tau_parallel:       run all tau_ref values at once (memory x number of values) instead of one after another
-    seed:               integer the random starts are drawn from
+    seed:               integer the random starts are drawn from; None draws one, which is printed and returned
     verbose:            print the likelihood (not for a fit warm-started from prev, a later step of a search that printed it) and the best fit, with its tau_ref
     likelihood_kwargs:  passed straight to the likelihood, e.g. repulsion={...}
     """
@@ -861,10 +862,14 @@ def run_maxL(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlik
     t_start = time.time()
     n_warm = num_starts // 2 if n_warm is None else n_warm
     model_kwargs = _model_kwargs(burst, single_pulse_fn, priors, n_pulses, shared_params, likelihood_kwargs)
+    if seed is None:
+        # JAX has no global random state, so draw a seed and keep it, so the fit can be repeated exactly
+        seed = int(np.random.default_rng().integers(2**31 - 1))
     if verbose:
         if prev is None:                          # a warm-started fit is a later step of a search that said it already
             amplitude = "fluence in units of SNR as A_snr" if "A_snr" in priors else "fluence as A"
-            print(f"run_maxL: likelihood {getattr(likelihood, '__name__', likelihood)}, parameterizing {amplitude}")
+            print(f"run_maxL: likelihood {getattr(likelihood, '__name__', likelihood)}, parameterizing {amplitude}, "
+                  f"seed {seed}")
         _announce_delta_init(priors, warm=prev is not None)
     z0, init_times, init_sigma = _starts(burst, single_pulse_fn, priors, likelihood, n_pulses, num_starts, n_warm,
                                          model_kwargs, likelihood_kwargs, seed, prev, search, split_starts,
@@ -942,7 +947,7 @@ def run_maxL(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlik
 
     out = dict(logL=logL, logL_starts=-f_end, ends=ends, map=values, post=post, M=np.asarray(M), z=z_best,
                priors=priors, init_times=init_times, init_sigma=init_sigma, seconds=seconds, tau_grid=tau_grid,
-               profile=profile, logL_runs=-f_runs, tau_end_runs=np.asarray(tau_end))
+               profile=profile, logL_runs=-f_runs, tau_end_runs=np.asarray(tau_end), seed=seed)
 
     if verbose:
         near = int(np.sum(-f_end >= logL - 1.0))

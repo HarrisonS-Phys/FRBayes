@@ -105,14 +105,18 @@ To switch device, restart the Python session or notebook kernel.
 
 One burst per `.npz` file, holding
 
-| key     | shape             | contents                                        |
-|---------|-------------------|-------------------------------------------------|
-| `power` | (n_chan, n_time)  | the dynamic spectrum, already dedispersed       |
-| `freq`  | (n_chan,)         | channel centre frequencies, in **MHz**          |
-| `time`  | (n_time,)         | sample times, in **seconds**                    |
+| key                     | shape            | contents                                                         |
+|-------------------------|------------------|------------------------------------------------------------------|
+| `power`                 | (n_chan, n_time) | the dynamic spectrum, already dedispersed                        |
+| `freq`                  | (n_chan,)        | channel centre frequencies, in **MHz**                           |
+| `time`                  | (n_time,)        | sample times, in **seconds**                                     |
+| `dm_dedispersion`       | scalar, optional | the DM the data were dedispersed with (pc cm⁻³)                  |
+| `dedispersion_ref_freq` | scalar, optional | the frequency the channels were aligned to (MHz; `inf` for infinite frequency) |
 
 The units matter: the dispersion constant and every prior assume MHz and seconds. Channels may be
-in any order. Bad channels must be **removed** from all three arrays, not zeroed or masked.
+in any order. Bad channels must be **removed** from all three arrays, not zeroed or masked. The two
+optional values record how the data were dedispersed, which `results.save_run` needs; without them in
+the file, pass them to `save_run` instead.
 
 The priors also need the telescope's band, `band=(bottom, top)` in MHz, which sets the bound of the
 spectral index prior. It is the full band, not the channels that survived, so the prior is the same
@@ -133,6 +137,9 @@ arguments.
 - The noise is assumed white (the same at every Fourier frequency), which may not hold for real data.
 - The noise level is estimated from the data before the burst and then treated as exactly known;
   its own uncertainty is not included.
+- The telescope's beam response is not modelled (`det_response` is a constant, 1 by default), so the
+  fitted spectra and fluences are those of the burst as seen through the beam, frequency structure
+  of the beam included.
 - A parameter whose posterior sits against a prior bound (an unresolved width at the narrowest
   allowed value, or a scattering time at the longest the window allows) is not flagged
   automatically; such values are limits, not measurements.

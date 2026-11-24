@@ -37,7 +37,7 @@ class ModelConstants:
     delta: int | float = -4  # scattering index, tau proportional to nu^delta; a Python int so nu^delta lowers to an integer power (a sampled 'delta' overrides it)
     k_DM: float = (2.41 * 1e-4) ** (-1)  # dispersion constant (pc^-1 cm^3 MHz^2 s)
     epsilon: int | float = -2  # dispersion index, delay proportional to nu^epsilon; the pulse model requires -2
-    DM_incoherent: float = 0.0  # DM removed only by incoherent dedispersion (pc cm^-3), which smears each raw channel; 0 for coherent dedispersion
+    DM_incoherent: float = 0.0  # DM removed only by incoherent dedispersion (pc cm^-3), which smears each raw channel: the total dedispersion DM less any DM removed coherently, negative if the incoherent step lowered the DM; 0 for fully coherent dedispersion
     freq_members: jnp.ndarray = None  # (n_chan, n_mem) centres (MHz) of the raw channels averaged into each channel, from data.prepare_burst; None leaves out intra-channel smearing
     raw_channel_width: float = 0.0  # width of one raw channel (MHz), burst.raw_dnu
 
@@ -230,7 +230,7 @@ def shared_transfer_fd(params_dict: dict, grid: FDGrid, constants: ModelConstant
         def spread(width, raw_width, f):
             """The run's boxcars in the Fourier domain: residual DM across it, DM_inc across a raw channel."""
             out = jnp.sinc(f * k_DM * DM * width)
-            if constants.DM_incoherent > 0:
+            if constants.DM_incoherent != 0:
                 out = out * jnp.sinc(f * k_DM * DM_inc * raw_width)
             return out
 
@@ -338,9 +338,9 @@ def setup_model(
     model_duration_pad: padding against wraparound (s), rounded up to an FFT-friendly window; 0 (default) for none; usually set with .extend_model_duration
     """
     constants = ModelConstants(**constants_dict)
-    if constants.DM_incoherent > 0 and (constants.freq_members is None or constants.raw_channel_width <= 0):
-        raise ValueError("DM_incoherent > 0 needs freq_members and raw_channel_width: intra-channel smearing "
-                         "would be silently omitted.")
+    if constants.DM_incoherent != 0 and (constants.freq_members is None or constants.raw_channel_width <= 0):
+        raise ValueError("a non-zero DM_incoherent needs freq_members and raw_channel_width: intra-channel "
+                         "smearing would be silently omitted.")
     grid = build_fd_grid(freqs_channels, times, constants, fourier_freqs)
 
     # ---- Padding: the longer window the template is evaluated on, and the cut back to the data ----

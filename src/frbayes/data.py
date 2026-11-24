@@ -53,6 +53,10 @@ class ConditionedData:
     # --- for plotting: the raw channels behind each block ---
     freq_members: jnp.ndarray = None  # (n_chan, n_avg) raw centres (MHz) of the good channels averaged into each block
 
+    # --- how the data were dedispersed, for results.save_run; None if the file does not say ---
+    dm_dedispersion: float = None  # DM the data were dedispersed with (pc cm^-3)
+    dedispersion_ref_freq: float = None  # frequency the dedispersion aligned the channels to (MHz; inf for infinite frequency)
+
 
 def block_average_channels(power, freq, n_avg):
     """
@@ -292,7 +296,7 @@ def prepare_burst(path, event_id=None, n_avg=8, fd_downsample=4, toa=None, exclu
     REMOVED, not zeroed or masked, since which channels remain decides where the block boundaries,
     and so each block's span and smearing, fall.
 
-    path:             .npz holding 'power' (n_chan, n_time), 'freq' (n_chan,) in MHz and 'time' (n_time,) in seconds, already dedispersed; channels in any order. The units matter: the dispersion constant and every prior assume MHz and seconds
+    path:             .npz holding 'power' (n_chan, n_time), 'freq' (n_chan,) in MHz and 'time' (n_time,) in seconds, already dedispersed; channels in any order. The units matter: the dispersion constant and every prior assume MHz and seconds. Optional scalars 'dm_dedispersion' (pc cm^-3) and 'dedispersion_ref_freq' (MHz, inf for infinite frequency) record how the data were dedispersed; results.save_run then needs neither
     event_id:         identifier of the burst, carried to the saved fit; not used in the conditioning
     n_avg:            raw channels averaged per block
     fd_downsample:    keep the lowest 1 / fd_downsample of the Fourier bins
@@ -303,6 +307,11 @@ def prepare_burst(path, event_id=None, n_avg=8, fd_downsample=4, toa=None, exclu
     """
     raw = jnp.load(path)
     power, freq, time = raw["power"], raw["freq"], raw["time"]
+    dm_dedispersion = float(raw["dm_dedispersion"]) if "dm_dedispersion" in raw else None
+    dedispersion_ref_freq = float(raw["dedispersion_ref_freq"]) if "dedispersion_ref_freq" in raw else None
+    if verbose and dm_dedispersion is not None:
+        print(f"dedispersed with DM {dm_dedispersion:g} pc cm^-3"
+              + (f" to {dedispersion_ref_freq:g} MHz" if dedispersion_ref_freq is not None else ""))
 
     # Order channels from the bottom of the band upward, whatever order the file holds them in
     order = np.argsort(np.asarray(freq))
@@ -375,6 +384,8 @@ def prepare_burst(path, event_id=None, n_avg=8, fd_downsample=4, toa=None, exclu
         freq_span=freq_span,
         raw_dnu=raw_dnu,
         freq_members=freq_members,
+        dm_dedispersion=dm_dedispersion,
+        dedispersion_ref_freq=dedispersion_ref_freq,
     )
 
     boxes = significant_boxes(burst)

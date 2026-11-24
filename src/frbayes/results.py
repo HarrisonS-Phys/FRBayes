@@ -69,6 +69,26 @@ def describe_data(path, event_id=None, n_bytes=None):
     }
 
 
+def _dedispersion_value(given, from_burst, name):
+    """
+    One of the two dedispersion values for save_run: the one given, else the burst's (from its
+    .npz); raises if both are set and differ, or if neither is.
+
+    given:      the value passed to save_run, or None
+    from_burst: the burst's value, or None
+    name:       the value's name, for the error messages
+    """
+    if given is not None and from_burst is not None and float(given) != float(from_burst):
+        raise ValueError(f"{name} = {given} differs from the burst's {name} = {from_burst} (read from its .npz).")
+    value = given if given is not None else from_burst
+    if value is None:
+        raise ValueError(f"{name} must be given, here or as '{name}' in the burst's .npz: the DM (pc cm^-3) the "
+                         f"data were dedispersed with, and the frequency (MHz, np.inf for infinite frequency) "
+                         f"it aligned the channels to. The fitted DM is only the residual on top of the first, "
+                         f"and the fitted arrival times are on the telescope's clock only at the second.")
+    return float(value)
+
+
 def save_run(path, mcmc, burst, priors, single_pulse_fn=None, hash_bytes=None, extra_samples=None,
              dm_dedispersion=None, dedispersion_ref_freq=None, **extra):
     """
@@ -91,26 +111,23 @@ def save_run(path, mcmc, burst, priors, single_pulse_fn=None, hash_bytes=None, e
     hash_bytes:      hash only the first hash_bytes of the data file (describe_data); None hashes all of it
     extra_samples:   further posterior arrays to store beside the sampled sites, each already shaped
                      (n_chains, n_draws, ...) and not sharing a name with a sampled site
-    dm_dedispersion: REQUIRED. The DM (pc cm^-3) the data were dedispersed with before this fit,
-                     e.g. from DM_phase; the fitted 'DM' is only the residual on top of it. Recorded
-                     as the attribute 'DM_dedispersion'
+    dm_dedispersion: the DM (pc cm^-3) the data were dedispersed with before this fit, e.g. from
+                     DM_phase; the fitted 'DM' is only the residual on top of it. None takes the
+                     burst's (from its .npz); one of the two is required. Recorded as the attribute
+                     'DM_dedispersion'
     dedispersion_ref_freq:
-                     REQUIRED. The frequency (MHz, np.inf for infinite frequency) the dedispersion
-                     aligned the channels to, recorded as 'dedispersion_ref_freq'. The data's time
+                     the frequency (MHz, np.inf for infinite frequency) the dedispersion
+                     aligned the channels to; None takes the burst's, and one of the two is required.
+                     Recorded as 'dedispersion_ref_freq'. The data's time
                      axis keeps the telescope's clock only at this frequency nu_dd, so the fitted
                      arrival time t at the model's reference nu_r is t + k DM_dedispersion
                      (nu_r^-2 - nu_dd^-2) on the telescope's clock
     extra:           any further scalars worth recording (n_pulses, ...), stored as strings
     """
-    if dm_dedispersion is None:
-        raise ValueError("dm_dedispersion must be given: the DM (pc cm^-3) the data were dedispersed "
-                         "with before this fit. The fitted DM is only the residual on top of it.")
-    dm_dedispersion = float(dm_dedispersion)
-    if dedispersion_ref_freq is None:
-        raise ValueError("dedispersion_ref_freq must be given: the frequency (MHz, np.inf for infinite "
-                         "frequency) the dedispersion aligned the channels to. Without it the fitted "
-                         "arrival times cannot be converted to the telescope's clock.")
-    dedispersion_ref_freq = float(dedispersion_ref_freq)
+    dm_dedispersion = _dedispersion_value(dm_dedispersion, getattr(burst, "dm_dedispersion", None),
+                                          "dm_dedispersion")
+    dedispersion_ref_freq = _dedispersion_value(dedispersion_ref_freq, getattr(burst, "dedispersion_ref_freq", None),
+                                                "dedispersion_ref_freq")
 
     samples = {k: np.asarray(v) for k, v in mcmc.get_samples(group_by_chain=True).items()}
     n_chains, n_draws = next(iter(samples.values())).shape[:2]
