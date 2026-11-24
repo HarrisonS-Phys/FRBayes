@@ -7,4 +7,3 @@ dist/
 .pytest_cache/
 .ruff_cache/
 .ipynb_checkpoints/
-*.h5

@@ -1,5 +1,9 @@
 # FRBayes
 
+**This is an alpha release.** The interface may change between versions, and results should be
+checked by eye (the plots are there for that); please report problems on the repository's issue
+tracker.
+
 Bayesian parameter estimation for fast radio bursts, with JAX and NumPyro. FRBayes fits a
 multi-pulse model of a dedispersed dynamic spectrum in the Fourier domain: a maximum-likelihood
 search finds the number of pulses, and NUTS samples the posterior of every pulse's arrival time,
