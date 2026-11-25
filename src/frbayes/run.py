@@ -319,6 +319,38 @@ def wall_clearance(burst, single_pulse_fn, priors, values, n_pulses, likelihood,
     return float(rep["x_min"]) + 10.0 * float(rep["w"]), float(rep["tau_scale"]) * tau0 * f
 
 
+def _initialize_jitted(likelihood, model_kwargs, init_strategy):
+    """
+    NumPyro's initialize_model compiled as a whole: run op by op it compiles every operation
+    separately, again whenever the shapes change, which took most of each step of the iterative
+    search. Under jit, initialize_model skips its check that the start is valid, so the returned
+    function checks it instead, as initialize_model does: the log density and its gradient must be
+    finite at every start. Returns a function of (rng_key, values) giving the unconstrained starting
+    point, a dict of arrays (with a leading axis if rng_key holds one key per start).
+
+    likelihood:    the NumPyro model
+    model_kwargs:  the likelihood's arguments (_model_kwargs)
+    init_strategy: a function of the starting values giving the NumPyro initialization strategy,
+                   e.g. lambda values: init_to_value(values=values)
+    """
+    @jax.jit
+    def init(rng_key, values):
+        info = initialize_model(rng_key, likelihood, init_strategy=init_strategy(values),
+                                model_kwargs=model_kwargs)[0]
+        return info.z, info.potential_energy, info.z_grad
+
+    def run(rng_key, values):
+        values = {k: jnp.asarray(v, dtype=jnp.float32) for k, v in values.items()}   # one dtype, one compilation
+        z, pe, grad = init(rng_key, values)
+        finite = bool(np.all(np.isfinite(np.asarray(pe)))) and all(
+            bool(np.all(np.isfinite(np.asarray(g)))) for g in jax.tree_util.tree_leaves(grad))
+        if not finite:
+            raise RuntimeError("Cannot find valid initial parameters: the log density or its gradient is not "
+                               "finite at a starting point. Please check the model and the starting values.")
+        return z
+    return run
+
+
 def _previous_fit_values(params, defaults, priors, n_pulses):
     """
     Starting values for a WARM start: the previous fit's n_pulses - 1 pulses as they were, plus one
@@ -546,11 +578,16 @@ def warm_start_points(burst, single_pulse_fn, priors, likelihood, model_kwargs, 
     values = _starting_values(burst, priors, n_pulses)                                    # random starts
     warm_values = _previous_fit_values(prev_params, values, priors, n_pulses)              # warm starts
 
+    to_unconstrained = _initialize_jitted(likelihood, model_kwargs, lambda vals: init_to_value(values=vals))
+
     def unconstrained(vals):
         """The starting values on the unconstrained scale the optimizer works on."""
-        return initialize_model(jax.random.PRNGKey(seed), likelihood, init_strategy=init_to_value(values=vals),
-                                model_kwargs=model_kwargs)[0].z
-    z_random, z_warm = unconstrained(values), unconstrained(warm_values)
+        return to_unconstrained(jax.random.PRNGKey(seed), vals)
+    # The random starts' values have no arrival times; giving them the warm starts' as placeholders
+    # gives both the same entries, so one compilation converts both. Every start's arrival times are
+    # replaced below, and NumPyro draws any other missing value with the same key either way.
+    random_values = {**values, time_param: warm_values[time_param]} if time_param not in values else values
+    z_random, z_warm = unconstrained(random_values), unconstrained(warm_values)
 
     sigma_range = (_interior(sigma_prior, float(sigma_prior.low)), _interior(sigma_prior, float(sigma_prior.high)))
     x, tail = wall_clearance(burst, single_pulse_fn, priors, values, n_pulses, likelihood, likelihood_kwargs)
@@ -628,9 +665,10 @@ def run_NUTS(
 ) -> MCMC:
     """
     Runs NUTS on one burst and returns the finished MCMC object, with the run's settings attached as
-    mcmc.seed, mcmc.priors, mcmc.n_pulses, mcmc.likelihood_kwargs (the likelihood's defaults, what was
-    passed, and shared_params). Prints the likelihood, how the amplitude is parameterized, and the
-    seed. Raises unless exactly one of 'A' and 'A_snr' is in priors.
+    mcmc.seed, mcmc.maxL_seed (the seed of the maxL_start fit, None without one), mcmc.priors,
+    mcmc.n_pulses, mcmc.likelihood_kwargs (the likelihood's defaults, what was passed, and
+    shared_params). Prints the likelihood, how the amplitude is parameterized, and the seed. Raises
+    unless exactly one of 'A' and 'A_snr' is in priors.
 
     burst:              the ConditionedData of the burst
     single_pulse_fn:    the model closure from model.setup_model
@@ -712,6 +750,8 @@ def run_NUTS(
     mcmc.run(jax.random.PRNGKey(seed), extra_fields=extra_fields, **run_kwargs)
 
     mcmc.seed = seed                  # the seed actually used; save_run records it
+    # The starting point depends on the maxL fit's own seed, so repeating the run exactly needs both
+    mcmc.maxL_seed = None if maxL_start is None else maxL_start.get("seed", best.get("seed"))
     mcmc.priors = dict(priors)
     mcmc.n_pulses = n_pulses
     # What actually ran: the likelihood's own defaults (e.g. repulsion on), what was passed, and shared_params
@@ -773,9 +813,9 @@ def _starts(burst, single_pulse_fn, priors, likelihood, n_pulses, num_starts, n_
     """
     if prev is None:
         keys = jax.random.split(jax.random.PRNGKey(seed), num_starts)
-        info = initialize_model(keys, likelihood, init_strategy=default_init(burst, priors, n_pulses),
-                                model_kwargs=model_kwargs)[0]
-        return info.z, None, None
+        strategy = default_init(burst, priors, n_pulses)
+        z = _initialize_jitted(likelihood, model_kwargs, lambda _: strategy)(keys, {})
+        return z, None, None
     return warm_start_points(burst, single_pulse_fn, priors, likelihood, model_kwargs, likelihood_kwargs,
                              prev["map"], prev["M"], search, n_pulses, num_starts, n_warm, seed,
                              split_starts=split_starts, box_spectrum=box_spectrum, verbose=verbose)
@@ -888,7 +928,7 @@ def run_maxL(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlik
         raise ValueError("run_maxL profiles tau_ref, so it must be shared between pulses (shared_params containing 'tau_ref').")
     _, unravel = ravel_pytree(z_one)
     f = lambda x: neg_log_l(unravel(x))
-    x0 = jax.vmap(lambda z: ravel_pytree(z)[0])(z0)                                  # (num_starts, d)
+    x0 = jax.jit(jax.vmap(lambda z: ravel_pytree(z)[0]))(z0)                         # (num_starts, d)
 
     # The tau_ref grid
     tau_prior = priors["tau_ref"]
@@ -931,19 +971,25 @@ def run_maxL(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlik
     x_end = jnp.asarray(np.asarray(x_runs)[best_tau, np.arange(num_starts)])
     f_end = f_runs[best_tau, np.arange(num_starts)]
 
+    # The bookkeeping below runs the model several times; each is compiled as a whole, since run op by
+    # op it compiles every operation separately, again at every pulse count
+    def site_values(z):
+        """Every sampled and deterministic site's value at the unconstrained point z."""
+        return {k: s["value"] for k, s in trace_at(z).items()
+                if s["type"] in ("sample", "deterministic") and not s.get("is_observed", False)}
+
     # where every start ended: its sampled parameters, constrained (for diagnosing the optimizer)
-    ends = jax.vmap(lambda x: constrain_fn(likelihood, (), model_kwargs, unravel(x)))(x_end)
+    ends = jax.jit(jax.vmap(lambda x: constrain_fn(likelihood, (), model_kwargs, unravel(x))))(x_end)
     ends = {k: np.asarray(v) for k, v in ends.items()}
     best = int(np.argmin(f_end))
     z_best = unravel(x_end[best])
-    tr = trace_at(z_best)
-    values = {k: np.asarray(s["value"]) for k, s in tr.items()
-              if s["type"] in ("sample", "deterministic") and not s.get("is_observed", False)}
+    values = {k: np.asarray(v) for k, v in jax.jit(site_values)(z_best).items()}
     post = {k: v[None] for k, v in values.items()}
-    M, _ = model_from_draw(single_pulse_fn, post, 0)
+    M = jax.jit(lambda p: model_from_draw(single_pulse_fn, p, 0)[0])(post)
     logL = -float(f_end[best])
     seconds = time.time() - t_start
-    tau_end = jax.vmap(jax.vmap(lambda x: constrain_fn(likelihood, (), model_kwargs, unravel(x))[TAU_SITE]))(x_runs)
+    tau_end = jax.jit(jax.vmap(jax.vmap(
+        lambda x: constrain_fn(likelihood, (), model_kwargs, unravel(x))[TAU_SITE])))(x_runs)
 
     out = dict(logL=logL, logL_starts=-f_end, ends=ends, map=values, post=post, M=np.asarray(M), z=z_best,
                priors=priors, init_times=init_times, init_sigma=init_sigma, seconds=seconds, tau_grid=tau_grid,

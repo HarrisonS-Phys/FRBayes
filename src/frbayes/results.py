@@ -93,7 +93,8 @@ def save_run(path, mcmc, burst, priors, single_pulse_fn=None, hash_bytes=None, e
              dm_dedispersion=None, dedispersion_ref_freq=None, **extra):
     """
     Writes a fit to netcdf: the posterior samples, with the priors, the data reference (the burst's
-    event_id and data_path, and the file's content hash) and the model's scalar constants as
+    event_id and data_path, and the file's content hash), the seeds of the NUTS run and of the maxL
+    fit it started from ('seed', 'maxL_seed'; empty if none) and the model's scalar constants as
     attributes, and the per-channel quantities the model was built from in the 'conditioning'
     group. The reference frequency is recorded because gamma and tau_ref are defined relative to
     it and it differs per burst. The posterior also gets 'DM_total' = dm_dedispersion + DM, draw by
@@ -156,6 +157,8 @@ def save_run(path, mcmc, burst, priors, single_pulse_fn=None, hash_bytes=None, e
     idata.posterior.attrs.update({
         "likelihood": mcmc.sampler.model.__name__,
         "seed": str(getattr(mcmc, "seed", "")),       # set by run.run_NUTS, so the run can be reproduced
+        # the seed of the maxL fit the chains started from, also needed to reproduce the run
+        "maxL_seed": "" if getattr(mcmc, "maxL_seed", None) is None else str(mcmc.maxL_seed),
         "sed_fn": _fn_name(getattr(single_pulse_fn, "sed_fn", None)),
         "pulse_fn": _fn_name(getattr(single_pulse_fn, "pulse_fn", None)),
         "freq_channels_ref": f"{burst.freq_channels_ref:.6f}",
@@ -187,13 +190,18 @@ def save_run(path, mcmc, burst, priors, single_pulse_fn=None, hash_bytes=None, e
 
 def load_run(path):
     """
-    Reads a saved fit back. Returns the DataTree: ["posterior"] holds the samples and, in its attrs,
-    the priors, likelihood, model constants and data reference; ["conditioning"] holds the
-    per-channel quantities needed to rebuild the model.
+    Reads a saved fit back into memory and closes the file, so the file can be overwritten (e.g. by
+    running save_run again) while the returned tree is still in use. Returns the DataTree:
+    ["posterior"] holds the samples and, in its attrs, the priors, likelihood, model constants and
+    data reference; ["conditioning"] holds the per-channel quantities needed to rebuild the model.
 
     path: the file save_run wrote
     """
-    return xr.open_datatree(str(path), engine="h5netcdf")
+    tree = xr.open_datatree(str(path), engine="h5netcdf")
+    try:
+        return tree.load()
+    finally:
+        tree.close()
 
 
 def check_data_unchanged(run, data_path, n_bytes=None):

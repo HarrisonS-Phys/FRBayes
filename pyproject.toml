@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "FRBayes"
-version = "0.1.0"
+version = "0.1.1"
 description = "Bayesian parameter estimation for Fast Radio Bursts using JAX and NumPyro"
 readme = "README.md"
 license = "MIT"
