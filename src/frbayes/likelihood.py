@@ -63,11 +63,12 @@ def sample_pulse_parameters(
     consistent after sampling by postprocess.order_pulses.
 
     n_pulses:      number of pulses in the model
-    shared_params: names of the parameters sampled once for the whole burst, e.g. ("DM", "tau_ref")
+    shared_params: names of the parameters sampled once for the whole burst, e.g. ("DM", "tau_ref", "delta"); a
+                   name not in priors is an error, except 'delta', which may be fixed rather than sampled
     priors:        one NumPyro distribution per parameter name, as built by run.set_priors
     time_param:    name of the arrival-time parameter, which cannot be shared
     """
-    unknown = set(shared_params) - priors.keys()
+    unknown = set(shared_params) - priors.keys() - {"delta"}      # delta may be fixed rather than sampled
     if unknown:
         raise ValueError(f"shared_params {sorted(unknown)} are not in priors.")
     if time_param in shared_params:
@@ -274,7 +275,7 @@ def FD_gaussianlikelihood(
     data_fd:         complex data on the retained Fourier bins, shape (n_chan, n_fourier), from data.prepare_burst
     sigma_noise_fd:  noise std of the real/imaginary part of each bin, shape (n_chan, 1) or (n_chan, n_fourier)
     n_pulses:        number of pulses in the model
-    shared_params:   names of the parameters sampled once for the whole burst, e.g. ("DM", "tau_ref")
+    shared_params:   names of the parameters sampled once for the whole burst, e.g. ("DM", "tau_ref", "delta")
     priors:          one prior per parameter, as built by run.set_priors, with exactly one of 'A' and 'A_snr'
     single_pulse_fn: the model closure from model.setup_model
     time_param:      name of the arrival-time parameter
