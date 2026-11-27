@@ -96,7 +96,9 @@ def save_run(path, mcmc, burst, priors, single_pulse_fn=None, hash_bytes=None, e
     event_id and data_path, and the file's content hash), the seeds of the NUTS run and of the maxL
     fit it started from ('seed', 'maxL_seed'; empty if none) and the model's scalar constants as
     attributes, and the per-channel quantities the model was built from in the 'conditioning'
-    group. The reference frequency is recorded because gamma and tau_ref are defined relative to
+    group. When NUTS was started from a maxL fit (run.run_NUTS with maxL_start), that fit is kept
+    in the 'maxL' group: every site's value, pulses in the fit's own order, with its best ln L
+    (including the repulsion prior) and seed as attributes. The reference frequency is recorded because gamma and tau_ref are defined relative to
     it and it differs per burst. The posterior also gets 'DM_total' = dm_dedispersion + DM, draw by
     draw: the dedispersion is a known shift applied to the data and the fit measures what remains,
     so the spread of DM_total is the spread of the residual DM. Returns the DataTree written.
@@ -184,6 +186,27 @@ def save_run(path, mcmc, burst, priors, single_pulse_fn=None, hash_bytes=None, e
         conditioning["freq_members"] = (("freq_channel", "member"), np.asarray(burst.freq_members))
     idata["conditioning"] = xr.Dataset(conditioning, coords={"freq_channel": freq})
 
+    # The maxL fit the chains started from (run.run_NUTS with maxL_start): every site's value at it,
+    # pulses in the fit's own order (not sorted by arrival time), with its best ln L and seed
+    maxL_fit = getattr(mcmc, "maxL_fit", None)
+    if maxL_fit is not None:
+        from .postprocess import PAIR_SITES
+        n_pulses = int(np.size(maxL_fit["map"]["mean_arrival_time"]))
+        variables = {}
+        for name, value in maxL_fit["map"].items():
+            value = np.asarray(value)
+            if name in PAIR_SITES:
+                dims = ("pulse_pair",)
+            elif value.shape == (n_pulses,):
+                dims = ("pulse",)
+            else:
+                dims = tuple(f"{name}_dim_{i}" for i in range(value.ndim))
+            variables[name] = (dims, value)
+        idata["maxL"] = xr.Dataset(variables, attrs={
+            "logL": "" if maxL_fit["logL"] is None else repr(maxL_fit["logL"]),   # includes the repulsion prior
+            "seed": "" if getattr(mcmc, "maxL_seed", None) is None else str(mcmc.maxL_seed),
+        })
+
     idata.to_netcdf(str(path), engine="h5netcdf")
     return idata
 
@@ -193,7 +216,8 @@ def load_run(path):
     Reads a saved fit back into memory and closes the file, so the file can be overwritten (e.g. by
     running save_run again) while the returned tree is still in use. Returns the DataTree:
     ["posterior"] holds the samples and, in its attrs, the priors, likelihood, model constants and
-    data reference; ["conditioning"] holds the per-channel quantities needed to rebuild the model.
+    data reference; ["conditioning"] holds the per-channel quantities needed to rebuild the model;
+    ["maxL"], when NUTS started from a maxL fit, holds that fit.
 
     path: the file save_run wrote
     """

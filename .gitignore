@@ -7,3 +7,6 @@ dist/
 .pytest_cache/
 .ruff_cache/
 .ipynb_checkpoints/
+scripts/
+catalog/
+catalog_run.log

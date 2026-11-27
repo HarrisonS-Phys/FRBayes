@@ -657,7 +657,7 @@ def run_NUTS(
     max_tree_depth: int | tuple[int, int] = (10, 8),
     chain_method: str = "auto",
     progress_bar: bool = True,
-    shared_params: tuple = ("DM", "tau_ref"),
+    shared_params: tuple = ("DM", "tau_ref", "delta"),
     extra_fields=("num_steps", "accept_prob", "diverging", "potential_energy"),
     target_accept_prob: float = 0.8,
     maxL_start: dict = None,
@@ -665,7 +665,8 @@ def run_NUTS(
 ) -> MCMC:
     """
     Runs NUTS on one burst and returns the finished MCMC object, with the run's settings attached as
-    mcmc.seed, mcmc.maxL_seed (the seed of the maxL_start fit, None without one), mcmc.priors,
+    mcmc.seed, mcmc.maxL_seed (the seed of the maxL_start fit, None without one), mcmc.maxL_fit
+    (that fit's values, 'map', and best ln L, 'logL'; None without one), mcmc.priors,
     mcmc.n_pulses, mcmc.likelihood_kwargs (the likelihood's defaults, what was passed, and
     shared_params). Prints the likelihood, how the amplitude is parameterized, and the seed. Raises
     unless exactly one of 'A' and 'A_snr' is in priors.
@@ -684,7 +685,7 @@ def run_NUTS(
     max_tree_depth:     largest NUTS tree depth d (at most 2^d - 1 leapfrog steps per draw), or a pair (warmup, sampling)
     chain_method:       "auto" matches the device ("parallel" on the CPU, "vectorized" on a GPU), or any NumPyro chain_method
     progress_bar:       show NumPyro's progress bar
-    shared_params:      parameters sampled once for the whole burst (as '<name>_shared'); () keeps every parameter per pulse
+    shared_params:      parameters sampled once for the whole burst (as '<name>_shared'); () keeps every parameter per pulse. 'delta' is shared only when it is sampled; when fixed it is one value anyway
     extra_fields:       per-draw sampler quantities kept beside the samples, read with mcmc.get_extra_fields()
     target_accept_prob: mean acceptance probability the step size is tuned for; higher gives smaller steps and fewer divergences
     maxL_start:         a maximum-likelihood fit to start every chain at its best point: run_maxL's result, or run_maxL_iterative's (its kept 'fit' is used); n_pulses is taken from it, and priors should be its 'priors'
@@ -697,7 +698,7 @@ def run_NUTS(
         n_pulses = int(np.size(best["map"]["mean_arrival_time"]))
         init_strategy = init_to_value(values={k: jnp.asarray(v) for k, v in best["map"].items() if k in best["z"]})
 
-    unknown = set(shared_params) - priors.keys()
+    unknown = set(shared_params) - priors.keys() - {"delta"}      # delta may be fixed rather than sampled
     if unknown:
         raise ValueError(f"shared_params {sorted(unknown)} are not in priors.")
 
@@ -752,6 +753,10 @@ def run_NUTS(
     mcmc.seed = seed                  # the seed actually used; save_run records it
     # The starting point depends on the maxL fit's own seed, so repeating the run exactly needs both
     mcmc.maxL_seed = None if maxL_start is None else maxL_start.get("seed", best.get("seed"))
+    # The maxL fit the chains started from, so that save_run keeps it with the samples
+    mcmc.maxL_fit = None if maxL_start is None else {
+        "map": {k: np.asarray(v) for k, v in best["map"].items()},
+        "logL": None if best.get("logL") is None else float(best["logL"])}
     mcmc.priors = dict(priors)
     mcmc.n_pulses = n_pulses
     # What actually ran: the likelihood's own defaults (e.g. repulsion on), what was passed, and shared_params
@@ -849,7 +854,7 @@ def _adam(f, n_steps, lr, lr_decay):
 
 def run_maxL(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlikelihood, num_starts=64,
              n_warm=None, prev=None, search=None, split_starts=True, box_spectrum=True,
-             shared_params=("DM", "tau_ref"), n_adam=1000, lr=0.05, lr_decay=0.01, tau_profile=8,
+             shared_params=("DM", "tau_ref", "delta"), n_adam=1000, lr=0.05, lr_decay=0.01, tau_profile=8,
              n_polish=500, lr_polish=0.01, tau_floor_dt_scale=0.1, tau_zero_dt_scale=1e-3, tau_parallel=False,
              seed=None, verbose=True, **likelihood_kwargs):
     """
@@ -883,7 +888,7 @@ def run_maxL(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlik
     search:             postprocess.excess_power_search of prev's residual
     split_starts:       let some warm starts split one old pulse in two (warm_start_points)
     box_spectrum:       start a box-placed new pulse with a spectrum peaked on its box's band (warm_start_points)
-    shared_params:      parameters sampled once for the whole burst; must include 'tau_ref', which is profiled
+    shared_params:      parameters sampled once for the whole burst; must include 'tau_ref', which is profiled; 'delta' is shared only when it is sampled
     n_adam:             Adam steps with tau_ref held at each grid value
     lr:                 starting step size of those steps, on the unconstrained scale
     lr_decay:           final step size of each Adam run as a fraction of its starting one
@@ -1008,7 +1013,7 @@ def run_maxL(burst, single_pulse_fn, priors, n_pulses, likelihood=FD_gaussianlik
 def run_maxL_iterative(burst, single_pulse_fn, likelihood=FD_gaussianlikelihood, snr_min=8.0, n_max=5,
                        num_starts=64, n_warm=None, split_starts=True, box_spectrum=True, s_opt=100.0,
                        seed=None, epsilon=0.2, p_false_alarm=0.01, plot_steps=False, verbose=True,
-                       prior_kwargs=None, shared_params=("DM", "tau_ref"), n_adam=1000, lr=0.05,
+                       prior_kwargs=None, shared_params=("DM", "tau_ref", "delta"), n_adam=1000, lr=0.05,
                        lr_decay=0.01, tau_profile=8, n_polish=500, lr_polish=0.01, tau_floor_dt_scale=0.1,
                        tau_zero_dt_scale=1e-3, tau_parallel=False, **likelihood_kwargs):
     """
@@ -1039,7 +1044,7 @@ def run_maxL_iterative(burst, single_pulse_fn, likelihood=FD_gaussianlikelihood,
     plot_steps:         plot each step's check (plotting.plot_boxes_explained)
     verbose:            print each step
     prior_kwargs:       passed to set_priors; must hold band=(bottom, top) in MHz, unless it gives gamma_range
-    shared_params:      parameters sampled once for the whole burst; must include 'tau_ref'
+    shared_params:      parameters sampled once for the whole burst; must include 'tau_ref'; 'delta' is shared only when it is sampled
     n_adam, lr, lr_decay, tau_profile, n_polish, lr_polish, tau_floor_dt_scale, tau_zero_dt_scale, tau_parallel: passed to run_maxL
     likelihood_kwargs:  passed straight to the likelihood, e.g. repulsion={...}
     """

@@ -58,8 +58,8 @@ downloads Python 3.13 if your system does not have it.
 From inside the project folder:
 
 ```bash
-uv add "frbayes[gpu] @ git+https://github.com/<owner>/FRBayes@v0.1.1"    # NVIDIA GPU (strongly recommended)
-uv add "frbayes @ git+https://github.com/<owner>/FRBayes@v0.1.1"         # CPU only
+uv add "frbayes[gpu] @ git+https://github.com/<owner>/FRBayes@v0.1.2"    # NVIDIA GPU (strongly recommended)
+uv add "frbayes @ git+https://github.com/<owner>/FRBayes@v0.1.2"         # CPU only
 ```
 
 This creates the project's virtual environment, a private Python installation in the folder
@@ -67,12 +67,12 @@ This creates the project's virtual environment, a private Python installation in
 Nothing is installed outside the project folder. The exact versions are recorded in `uv.lock`, so
 `uv sync` can recreate the same environment later or on another machine.
 
-- `@v0.1.1` installs that release of FRBayes.
+- `@v0.1.2` installs that release of FRBayes.
 - `[gpu]` also installs JAX's NVIDIA CUDA libraries, a few GB, which install only on Linux with an
   NVIDIA GPU; leave it out on a machine without one.
 - FRBayes is not on PyPI yet, so it is installed straight from its GitHub repository. If the
   repository is private, you need access to it, and git must be able to sign in to GitHub; to use
-  an SSH key, write `git+ssh://git@github.com/<owner>/FRBayes@v0.1.1` instead.
+  an SSH key, write `git+ssh://git@github.com/<owner>/FRBayes@v0.1.2` instead.
 
 ### 4. Use the environment
 
@@ -119,8 +119,8 @@ In an environment uv does not manage, such as a conda environment, install with 
 run the check above with `python` in place of `uv run python`:
 
 ```bash
-pip install "frbayes[gpu] @ git+https://github.com/<owner>/FRBayes@v0.1.1"    # NVIDIA GPU (strongly recommended)
-pip install "frbayes @ git+https://github.com/<owner>/FRBayes@v0.1.1"         # CPU only
+pip install "frbayes[gpu] @ git+https://github.com/<owner>/FRBayes@v0.1.2"    # NVIDIA GPU (strongly recommended)
+pip install "frbayes @ git+https://github.com/<owner>/FRBayes@v0.1.2"         # CPU only
 ```
 
 Use one tool per environment: do not install into a uv project with pip, or into a conda
